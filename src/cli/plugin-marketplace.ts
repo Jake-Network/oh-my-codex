@@ -1586,6 +1586,8 @@ async function validateStagedPluginSnapshot(
 	}
 	const launcherReason = await getPinnedLauncherIncompatibilityReason(snapshotPath, packagedMarketplace);
 	if (launcherReason) throw new Error(`Packaged OMX plugin snapshot has invalid launcher provenance: ${launcherReason.reason}`);
+	const templatesReason = await omxPluginCacheTemplatesProvenanceReason(snapshotPath, packagedMarketplace);
+	if (templatesReason) throw new Error(`Packaged OMX plugin snapshot has invalid template provenance: ${templatesReason}`);
 }
 
 async function stageCompletePluginSnapshot(
