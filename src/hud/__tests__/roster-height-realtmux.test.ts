@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { it } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { isRealTmuxAvailable, withTempTmuxSession } from '../../team/__tests__/tmux-test-fixture.js';
-import { registerHudResizeHook } from '../tmux.js';
+import { readHudResizeHookContext, registerHudResizeHook } from '../tmux.js';
 
 it('keeps a live 20-worker roster bounded after window shrink and grows it back', async t => {
   if (!isRealTmuxAvailable()) { t.skip('tmux is not installed'); return; }
@@ -16,19 +16,22 @@ it('keeps a live 20-worker roster bounded after window shrink and grows it back'
       import { runWatchMode } from ${JSON.stringify(new URL('../index.js', import.meta.url).href)};
       process.env.OMX_TMUX_HUD_OWNER = '1';
       process.env.OMX_TMUX_HUD_LEADER_PANE = process.argv[2];
+      process.env.OMX_SESSION_ID = 'roster-height-test';
       await runWatchMode(${JSON.stringify(dir)}, { watch: true, preset: 'focused' }, {
         readAllStateFn: async () => ({ team: { active: true, team_name: 'checkout', agent_count: 20,
           workers: Array.from({ length: 20 }, (_, i) => ({ name: 'worker-' + (i + 1), state: 'working' })) } }),
         readHudConfigFn: async () => ({ preset: 'focused' }),
         runAuthorityTickFn: async () => {}, reconcileTmuxHudFn: async () => {},
-        registerHudResizeHookFn: () => true, isSessionAttachedFn: () => true,
+        registerHudResizeHookFn: () => true, readHudHookHealthFn: () => 'healthy', isSessionAttachedFn: () => true,
       });
     `);
     await withTempTmuxSession({ useAmbientServer: false }, async fixture => {
+      fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', 'roster-height-test']);
       fixture.run(['set-option', '-g', 'status', 'off']);
       fixture.run(['resize-window', '-t', fixture.windowTarget, '-x', '90', '-y', '70']);
       const hud = fixture.run(['split-window', '-d', '-v', '-l', '2', '-P', '-F', '#{pane_id}',
-        '-t', fixture.leaderPaneId, process.execPath, script, fixture.leaderPaneId]);
+        '-t', fixture.leaderPaneId,
+        `env OMX_TMUX_HUD_OWNER=1 OMX_SESSION_ID=roster-height-test OMX_TMUX_HUD_LEADER_PANE=${fixture.leaderPaneId} ${process.execPath} ${script} ${fixture.leaderPaneId} hud --watch`]);
       const height = (pane: string) => Number(fixture.run(['display-message', '-p', '-t', pane, '#{pane_height}']));
       const waitForFrame = async (expectedHeight: number, text: string) => {
         for (let attempt = 0; attempt < 80; attempt += 1) {
@@ -43,11 +46,13 @@ it('keeps a live 20-worker roster bounded after window shrink and grows it back'
       fixture.run(['resize-pane', '-t', hud, '-y', '14']);
       await waitForFrame(22, 'worker-20');
 
-      // Register only the resize hook: layout reconciliation is tested separately.
-      assert.equal(registerHudResizeHook(hud, fixture.leaderPaneId, 22, { cwd: dir, env: fixture.env }, args => {
-        if (args[0] === 'set-hook' && !args.some(arg => arg.startsWith('client-resized['))) return '';
-        return fixture.run(args) + '\n';
-      }), true);
+      assert.equal(registerHudResizeHook(hud, fixture.leaderPaneId, 22,
+        { cwd: dir, env: { ...fixture.env, OMX_SESSION_ID: 'roster-height-test' } },
+        args => fixture.run(args) + '\n'), true);
+      const hookContext = readHudResizeHookContext(hud, fixture.leaderPaneId, args => fixture.run(args) + '\n');
+      assert.ok(hookContext);
+      fixture.run(['set-hook', '-u', '-t', fixture.sessionName, hookContext.splitHookSlot]);
+      fixture.run(['set-hook', '-u', '-w', '-t', fixture.leaderPaneId, hookContext.layoutHookSlot]);
       fixture.run(['resize-window', '-t', fixture.windowTarget, '-y', '24']);
       fixture.run(['set-hook', '-R', '-t', fixture.sessionName, 'client-resized']);
       await waitForFrame(11, '+11 workers');

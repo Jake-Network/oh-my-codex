@@ -1,12 +1,15 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
+import { resolve } from 'node:path';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_HEIGHT_LINES, HUD_TMUX_MAX_HEIGHT_LINES } from './constants.js';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 
 export interface TmuxPaneSnapshot {
   paneId: string;
+  sessionId?: string;
+  windowId?: string;
   currentCommand: string;
   startCommand: string;
   panePid?: string;
@@ -52,6 +55,12 @@ export interface HudPaneOwner {
   sessionId?: string;
   sessionIds?: string[];
   leaderPaneId?: string;
+}
+
+export interface HudTmuxMutationAuthority {
+  leaderPaneId: string;
+  leaderPanePid: string;
+  ownerId: string;
 }
 export type HudRuntimeRootSource = 'team-env' | 'omx-root-env' | 'omx-state-root-env' | 'cwd-default';
 
@@ -205,19 +214,29 @@ export function parseTmuxPaneSnapshot(
       && windowHeight !== null
     );
     if (hasGeometryFields && !hasGeometry) return [];
-    const payloadParts = hasGeometry ? parts.slice(9) : parts.slice(2);
-    const hasIncarnationFields = hasGeometry
+    const hasAuthorityFields = hasGeometry
+      && isTmuxSessionId(parts[9] ?? '')
+      && isTmuxWindowId(parts[10] ?? '')
+      && /^(?:0|1)$/.test(parts[11] ?? '')
+      && parsePositiveInteger(parts[12]) !== null;
+    if (hasGeometry && fieldSeparator === TMUX_PANE_FIELD_SEPARATOR && parts.length >= 15 && !hasAuthorityFields) return [];
+    const payloadParts = hasGeometry ? parts.slice(hasAuthorityFields ? 13 : 9) : parts.slice(2);
+    const hasTrailingIncarnationFields = hasGeometry
       && payloadParts.length >= 4
       && /^(?:0|1)$/.test(payloadParts.at(-2) ?? '')
       && parsePositiveInteger(payloadParts.at(-1)) !== null;
-    const incarnationParts = hasIncarnationFields ? payloadParts.slice(-2) : [];
-    const commandParts = hasIncarnationFields ? payloadParts.slice(0, -2) : payloadParts;
+    const hasIncarnationFields = hasAuthorityFields || hasTrailingIncarnationFields;
+    const incarnationParts = hasAuthorityFields
+      ? parts.slice(11, 13)
+      : hasTrailingIncarnationFields ? payloadParts.slice(-2) : [];
+    const commandParts = hasTrailingIncarnationFields ? payloadParts.slice(0, -2) : payloadParts;
     const hasCurrentPathColumn = commandParts.length >= 2;
     const currentPath = hasCurrentPathColumn ? (commandParts.at(-1) ?? '') : '';
     const startCommandParts = hasCurrentPathColumn ? commandParts.slice(0, -1) : commandParts;
     const trimmedCurrentPath = currentPath.trim();
     panes.push({
       paneId,
+      ...(hasAuthorityFields ? { sessionId: parts[9]!, windowId: parts[10]! } : {}),
       currentCommand: currentCommand.trim(),
       startCommand: startCommandParts.join('\t').trim(),
       ...(trimmedCurrentPath ? { currentPath: trimmedCurrentPath } : {}),
@@ -797,6 +816,56 @@ function hudHookIdentityToken(hookName: string, hookSlot: string): string {
   return `omx-${(hash >>> 0).toString(16)}`;
 }
 
+function hudHookExpectedCommandOption(hookSlot: string): string {
+  return hudHookIdentityOption(hookSlot).replace('@omx_hook_identity_', '@omx_hook_expected_');
+}
+
+function hudHookConfigurationOption(hookSlot: string): string {
+  return hudHookIdentityOption(hookSlot).replace('@omx_hook_identity_', '@omx_hook_configuration_');
+}
+
+function canonicalHudHookCwd(cwd: string): string {
+  const absolute = resolve(cwd);
+  try {
+    return realpathSync.native(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return absolute;
+    throw error;
+  }
+}
+
+function hudHookConfigurationToken(context: HudResizeHookContext, hookSlot: string, heightLines: number, cwd: string): string {
+  return createHash('sha256').update(JSON.stringify([
+    'hud-hook-v2', context.sessionId, context.windowId, context.leaderPaneId, context.leaderPanePid,
+    context.hudPaneId, context.hudPanePid, context.ownerId ?? '', hookSlot, String(heightLines), canonicalHudHookCwd(cwd),
+  ])).digest('hex');
+}
+
+function recordHudHookExpectedCommand(
+  context: HudResizeHookContext,
+  hookSlot: string,
+  heightLines: number,
+  cwd: string,
+  execTmuxSync: TmuxExecSync,
+  authority?: HudTmuxMutationAuthority,
+): boolean {
+  const canonicalCommand = parseExactTmuxAuthorityScalar(execTmuxSync([
+    'display-message', '-p', '-t', context.leaderPaneId, `#{${hookSlot}}`,
+  ]));
+  if (!canonicalCommand) throw new Error('invalid_tmux_hook_command');
+  const commands = [
+    `set-option -t ${context.sessionId} ${hudHookExpectedCommandOption(hookSlot)} ${shellEscapeSingle(canonicalCommand)}`,
+    `set-option -t ${context.sessionId} ${hudHookConfigurationOption(hookSlot)} ${hudHookConfigurationToken(context, hookSlot, heightLines, cwd)}`,
+  ].join(' ; ');
+  if (authority) return executeHudCommandUnderAuthority(authority, commands, execTmuxSync);
+  execTmuxSync(['set-option', '-t', context.sessionId, hudHookExpectedCommandOption(hookSlot), canonicalCommand]);
+  execTmuxSync([
+    'set-option', '-t', context.sessionId,
+    hudHookConfigurationOption(hookSlot), hudHookConfigurationToken(context, hookSlot, heightLines, cwd),
+  ]);
+  return true;
+}
+
 function buildHudHookRegistrationSuffix(context: HudResizeHookContext, hookSlot: string): string[] {
   return [
     ';', 'set-option', '-t', context.sessionId,
@@ -805,18 +874,40 @@ function buildHudHookRegistrationSuffix(context: HudResizeHookContext, hookSlot:
 }
 
 function buildHudHookUnsetCommand(context: HudResizeHookContext, hookSlot: string): string {
-  return hookSlot.startsWith('window-layout-changed[')
+  const unsetHook = hookSlot.startsWith('window-layout-changed[')
     ? `set-hook -u -w -t ${context.windowId} ${hookSlot}`
     : `set-hook -u -t ${context.sessionId} ${hookSlot}`;
+  return `${unsetHook} ; set-option -u -t ${context.sessionId} ${hudHookExpectedCommandOption(hookSlot)} ; set-option -u -t ${context.sessionId} ${hudHookConfigurationOption(hookSlot)}`;
 }
 
-function buildGuardedHudHookUnregisterArgs(context: HudResizeHookContext, hookSlot: string): string[] {
+function buildGuardedHudHookUnregisterArgs(
+  context: HudResizeHookContext,
+  hookSlot: string,
+  marker: string,
+  authority?: HudTmuxMutationAuthority,
+): string[] {
   const identityOption = hudHookIdentityOption(hookSlot);
+  const identityCondition = `#{==:#{${identityOption}},${hudHookIdentityToken(context.hookName, hookSlot)}}`;
+  const rejected = `display-message -p __omx_hud_unregister_failed_${marker}`;
+  const absentOrForeign = [
+    'if-shell', '-F', '-t', context.leaderPaneId,
+    `#{==:#{${identityOption}},}`,
+    `display-message -p ${marker}`,
+    rejected,
+  ].map(shellEscapeSingle).join(' ');
+  const ownedOrAbsent = [
+    'if-shell', '-F', '-t', context.leaderPaneId,
+    identityCondition,
+    `${buildHudHookUnsetCommand(context, hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption} ; display-message -p ${marker}`,
+    absentOrForeign,
+  ].map(shellEscapeSingle).join(' ');
   return [
-    'if-shell', '-F', '-t', context.sessionId,
-    `#{==:${identityOption},${hudHookIdentityToken(context.hookName, hookSlot)}}`,
-    `${buildHudHookUnsetCommand(context, hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`,
-    '',
+    'if-shell', '-F', '-t', context.leaderPaneId,
+    authority
+      ? buildHudMutationAuthorityCondition(authority)
+      : combineTmuxConditions(`#{==:#{pane_id},${context.leaderPaneId}}`, '#{==:#{pane_dead},0}'),
+    ownedOrAbsent,
+    rejected,
   ];
 }
 
@@ -832,6 +923,39 @@ export interface HudResizeHookContext {
   hookSlot: string;
   layoutHookSlot: string;
   splitHookSlot: string;
+}
+
+export type HudHookHealth = 'healthy' | 'repair_needed' | 'unknown' | 'owner_mismatch';
+
+export function readHudLeaderOwnerIdentity(
+  leaderPaneId: string,
+  expectedOwnerId: string,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): 'current' | 'mismatch' | 'unknown' {
+  const paneId = parseCanonicalTmuxPaneId(leaderPaneId);
+  if (!paneId || !expectedOwnerId.trim()) return 'unknown';
+  try {
+    const output = parseExactTmuxAuthorityScalar(execTmuxSync([
+      'display-message', '-p', '-t', paneId, '#{pane_id}|#{pane_dead}|#{@omx_instance_id}',
+    ]));
+    if (!output) return 'unknown';
+    const fields = output.split('|');
+    if (fields.length !== 3 || fields[0] !== paneId || fields[1] !== '0') return 'unknown';
+    if (!fields[2] || !/^\S+$/.test(fields[2])) return 'unknown';
+    return fields[2] === expectedOwnerId ? 'current' : 'mismatch';
+  } catch {
+    return 'unknown';
+  }
+}
+
+export interface ReadHudHookHealthInput extends RegisterHudResizeHookOptions {
+  sessionId: string;
+  windowId: string;
+  leaderPaneId: string;
+  leaderPanePid: string;
+  hudPaneId: string;
+  hudPanePid: string;
+  heightLines: number;
 }
 
 function readHudResizeHookPaneIncarnations(
@@ -868,7 +992,7 @@ export function parseHudResizeHookContext(
 ): HudResizeHookContext | null {
   const line = parseExactTmuxAuthorityScalar(output);
   if (line === null) return null;
-  const parts = line.split('\t');
+  const parts = line.includes('|') ? line.split('|') : line.split('\t');
   if (parts.length !== 2 || parts.some((part) => part.trim() !== part || part === '')) return null;
   const [sessionId = '', windowId = ''] = parts;
   const normalizedLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
@@ -906,7 +1030,7 @@ export function readHudResizeHookContext(
         '-p',
         '-t',
         canonicalLeaderPaneId,
-        '#{session_id}\t#{window_id}',
+        '#{session_id}|#{window_id}',
       ]),
       canonicalLeaderPaneId,
       canonicalHudPaneId,
@@ -933,13 +1057,63 @@ function buildHudHookIncarnationCondition(paneId: string, panePid: string): stri
   return `#{&&:#{==:#{pane_id},${paneId}},#{&&:#{==:#{pane_dead},0},#{==:#{pane_pid},${panePid}}}}`;
 }
 
+function combineTmuxConditions(...conditions: string[]): string {
+  return conditions.reduce((combined, condition) => combined ? `#{&&:${combined},${condition}}` : condition, '');
+}
+
+function normalizeHudMutationAuthority(authority: HudTmuxMutationAuthority): HudTmuxMutationAuthority | null {
+  const leaderPaneId = parseCanonicalTmuxPaneId(authority.leaderPaneId);
+  const leaderPanePid = parsePositiveInteger(authority.leaderPanePid);
+  const ownerId = authority.ownerId.trim();
+  if (!leaderPaneId || !leaderPanePid || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(ownerId)) return null;
+  return { leaderPaneId, leaderPanePid: String(leaderPanePid), ownerId };
+}
+
+function buildHudMutationAuthorityCondition(authority: HudTmuxMutationAuthority): string {
+  return combineTmuxConditions(
+    buildHudHookIncarnationCondition(authority.leaderPaneId, authority.leaderPanePid),
+    `#{==:#{@omx_instance_id},${authority.ownerId}}`,
+  );
+}
+
+function executeHudCommandUnderAuthority(
+  authority: HudTmuxMutationAuthority,
+  command: string,
+  execTmuxSync: TmuxExecSync,
+): boolean {
+  const marker = `__omx_hud_authority_${randomUUID()}`;
+  try {
+    return parseExactTmuxAuthorityScalar(execTmuxSync([
+      'if-shell', '-F', '-t', authority.leaderPaneId,
+      buildHudMutationAuthorityCondition(authority),
+      `${command} ; display-message -p ${marker}`,
+      `display-message -p __omx_hud_authority_failed_${marker}`,
+    ])) === marker;
+  } catch {
+    return false;
+  }
+}
+
+function buildHudHookRegistrationCommand(
+  targetArgs: string[],
+  hookSlot: string,
+  registrationCommand: string,
+  context: HudResizeHookContext,
+): string {
+  return [
+    'set-hook', ...targetArgs, hookSlot, shellEscapeSingle(registrationCommand),
+    ';', 'set-option', '-t', context.sessionId,
+    hudHookIdentityOption(hookSlot), hudHookIdentityToken(context.hookName, hookSlot),
+  ].join(' ');
+}
+
 function deferTmuxHookFormatExpansion(command: string): string {
   return command.replaceAll('#{', '##{');
 }
 
 function buildHudHookSelfUnregister(context: HudResizeHookContext): string {
   const identityOption = hudHookIdentityOption(context.hookSlot);
-  return `if-shell -F -t ${context.sessionId} ${quoteHudHookShellArgument(`#{==:${identityOption},${hudHookIdentityToken(context.hookName, context.hookSlot)}}`)} ${quoteHudHookShellArgument(`${buildHudHookUnsetCommand(context, context.hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`)} ''`;
+  return `if-shell -F -t ${context.sessionId} ${quoteHudHookShellArgument(`#{==:#{${identityOption}},${hudHookIdentityToken(context.hookName, context.hookSlot)}}`)} ${quoteHudHookShellArgument(`${buildHudHookUnsetCommand(context, context.hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`)} ''`;
 }
 
 function buildAtomicHudHookCommand(
@@ -1004,25 +1178,29 @@ function buildHudResizeHookCommand(
 }
 
 
-function buildHudLayoutReconcileHookCommand(
+export function buildHudLayoutReconcileHookCommand(
   tmuxBin: string,
   omxBin: string,
   leaderPaneId: string,
   context: HudResizeHookContext,
   hookSlot: string,
   options: RegisterHudResizeHookOptions = {},
+  platform: NodeJS.Platform = process.platform,
 ): string {
   const env = options.env ?? process.env;
   const cwd = options.cwd?.trim() || process.cwd();
-  const reconcileEnv = buildEnvPrefix({
+  const reconcileRuntimeEnv = {
     TMUX: env.TMUX,
     TMUX_PANE: leaderPaneId,
     OMX_TMUX_HUD_OWNER: '1',
+    OMX_HUD_WATCH_REPAIR: '1',
+    OMX_HUD_WATCH_LEADER_PID: context.leaderPanePid,
     OMX_SESSION_ID: env.OMX_SESSION_ID,
     OMX_ROOT: env.OMX_ROOT,
     OMX_STATE_ROOT: env.OMX_STATE_ROOT,
     OMX_TEAM_STATE_ROOT: env.OMX_TEAM_STATE_ROOT,
-  });
+  };
+  const reconcileEnv = buildEnvPrefix(reconcileRuntimeEnv);
   const reconcile = [
     'cd',
     shellEscapeSingle(cwd),
@@ -1033,13 +1211,113 @@ function buildHudLayoutReconcileHookCommand(
     '--reconcile-tmux',
   ].join(' ');
   const layoutContext = { ...context, hookSlot };
-  if (process.platform === 'win32') {
-    const nativeReconcile = `Set-Location -LiteralPath '${cwd.replace(/'/g, "''")}'; & '${process.execPath.replace(/'/g, "''")}' '${omxBin.replace(/'/g, "''")}' hud --reconcile-tmux | Out-Null`;
+  if (platform === 'win32') {
+    const powerShellEnv = Object.entries(reconcileRuntimeEnv)
+      .filter((entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].trim() !== '')
+      .map(([key, value]) => `$env:${key} = '${value.replace(/'/g, "''")}'`)
+      .join('; ');
+    const nativeReconcile = `${powerShellEnv}; Set-Location -LiteralPath '${cwd.replace(/'/g, "''")}'; & '${process.execPath.replace(/'/g, "''")}' '${omxBin.replace(/'/g, "''")}' hud --reconcile-tmux | Out-Null`;
     const success = `${buildHudHookSelfUnregister(layoutContext)} ; run-shell -b ${quoteHudHookShellArgument(nativeReconcile)}`;
     return buildAtomicHudHookCommand(tmuxBin, layoutContext, success, env.TMUX);
   }
   const success = `${buildHudHookSelfUnregister(layoutContext)} ; run-shell -b ${quoteHudHookShellArgument(`${reconcile} >/dev/null 2>&1 || true`)}`;
   return buildAtomicHudHookCommand(tmuxBin, layoutContext, success, env.TMUX);
+}
+
+export function readHudHookHealth(
+  input: ReadHudHookHealthInput,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): HudHookHealth {
+  const leaderPaneId = parseCanonicalTmuxPaneId(input.leaderPaneId);
+  const hudPaneId = parseCanonicalTmuxPaneId(input.hudPaneId);
+  const leaderPanePid = parsePositiveInteger(input.leaderPanePid);
+  const hudPanePid = parsePositiveInteger(input.hudPanePid);
+  if (
+    !leaderPaneId
+    || !hudPaneId
+    || !leaderPanePid
+    || !hudPanePid
+    || !isTmuxSessionId(input.sessionId)
+    || !isTmuxWindowId(input.windowId)
+    || !Number.isFinite(input.heightLines)
+    || input.heightLines < 1
+  ) return 'unknown';
+
+  const hookName = buildHudResizeHookName(input.sessionId, input.windowId, leaderPaneId);
+  const context: HudResizeHookContext = {
+    sessionId: input.sessionId,
+    windowId: input.windowId,
+    leaderPaneId,
+    leaderPanePid: String(leaderPanePid),
+    hudPaneId,
+    hudPanePid: String(hudPanePid),
+    hookName,
+    hookSlot: buildHudResizeHookSlot(hookName),
+    layoutHookSlot: buildHudLayoutHookSlot(hookName),
+    splitHookSlot: buildHudSplitHookSlot(hookName),
+  };
+  const slots = [context.hookSlot, context.layoutHookSlot, context.splitHookSlot] as const;
+  const identityOptions = slots.map(hudHookIdentityOption);
+  const ownerId = (input.env?.OMX_SESSION_ID ?? process.env.OMX_SESSION_ID)?.trim();
+  if (!ownerId) return 'unknown';
+  const ownedContext = { ...context, ownerId };
+  const format = [
+    '#{pane_id}',
+    '#{pane_dead}',
+    '#{pane_pid}',
+    '#{session_id}',
+    '#{window_id}',
+    '#{@omx_instance_id}',
+    ...slots.map(slot => `#{?#{&&:#{==:#{${slot}},#{${hudHookExpectedCommandOption(slot)}}},#{==:#{${hudHookConfigurationOption(slot)}},${hudHookConfigurationToken(ownedContext, slot, input.heightLines, input.cwd?.trim() || process.cwd())}}},1,0}`),
+    ...identityOptions.map(option => `#{${option}}`),
+  ].join('|');
+
+  let fields: string[];
+  try {
+    const output = parseExactTmuxAuthorityScalar(execTmuxSync([
+      'display-message', '-p', '-t', leaderPaneId, format,
+    ]));
+    if (output === null) return 'unknown';
+    fields = output.split('|');
+  } catch {
+    return 'unknown';
+  }
+  if (fields.length !== 12) return 'unknown';
+
+  const [
+    observedLeaderPaneId,
+    observedLeaderDead,
+    observedLeaderPanePid,
+    observedSessionId,
+    observedWindowId,
+    observedOwnerId,
+    ...observedHooksAndIdentities
+  ] = fields;
+  if (
+    parseCanonicalTmuxPaneId(observedLeaderPaneId) !== observedLeaderPaneId
+    || !/^[01]$/.test(observedLeaderDead ?? '')
+    || parsePositiveInteger(observedLeaderPanePid) === null
+    || !isTmuxSessionId(observedSessionId ?? '')
+    || !isTmuxWindowId(observedWindowId ?? '')
+    || (observedOwnerId !== '' && !/^\S+$/.test(observedOwnerId ?? ''))
+  ) return 'unknown';
+  if (
+    observedLeaderPaneId !== leaderPaneId
+    || observedLeaderDead !== '0'
+    || observedLeaderPanePid !== String(leaderPanePid)
+    || observedSessionId !== input.sessionId
+    || observedWindowId !== input.windowId
+  ) return 'repair_needed';
+  if (!observedOwnerId) return 'unknown';
+  if (observedOwnerId !== ownerId) return 'owner_mismatch';
+
+  const expectedHealthAndIdentities = [
+    '1', '1', '1',
+    ...slots.map(slot => hudHookIdentityToken(hookName, slot)),
+  ];
+  return observedHooksAndIdentities.every((value, index) => value === expectedHealthAndIdentities[index])
+      ? 'healthy'
+      : 'repair_needed';
 }
 
 function unregisterLegacyHudResizeHook(
@@ -1174,10 +1452,12 @@ export function listCurrentWindowPanes(
         '#{pane_bottom}',
         '#{window_width}',
         '#{window_height}',
-        '#{pane_start_command}',
-        '#{pane_current_path}',
+        '#{session_id}',
+        '#{window_id}',
         '#{pane_dead}',
         '#{pane_pid}',
+        '#{pane_start_command}',
+        '#{pane_current_path}',
       ].join(TMUX_PANE_FIELD_SEPARATOR),
     ]);
     if (!parseExactTmuxAuthorityLines(paneSnapshotOutput)) return [];
@@ -1218,11 +1498,11 @@ export function readCurrentWindowSize(
       'display-message',
       '-p',
       ...(canonicalCurrentPaneId ? ['-t', canonicalCurrentPaneId] : []),
-      '#{window_width}\t#{window_height}',
+      '#{window_width}|#{window_height}',
     ]);
     const framed = parseExactTmuxAuthorityScalar(raw);
     if (framed === null) return { width: null, height: null };
-    const fields = framed.split('\t');
+    const fields = framed.split('|');
     if (fields.length !== 2) return { width: null, height: null };
     const width = parsePositiveInteger(fields[0]);
     const height = parsePositiveInteger(fields[1]);
@@ -1258,10 +1538,10 @@ function readHudSplitSourceAuthority(
       'display-message',
       '-p',
       ...(targetPaneId ? ['-t', targetPaneId] : []),
-      '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_id}\t#{window_id}',
+      '#{pane_id}|#{pane_dead}|#{pane_pid}|#{session_id}|#{window_id}',
     ]));
     if (!source) return null;
-    const fields = source.split('\t');
+    const fields = source.split('|');
     if (fields.length !== 5) return null;
     const paneId = parseCanonicalTmuxPaneId(fields[0]);
     const paneDead = fields[1];
@@ -1341,17 +1621,19 @@ function hasHudSplitOperationMarker(startCommand: string, marker: string): boole
 
 export function findHudSplitOperationMarkerPaneId(marker: string, execTmuxSync: TmuxExecSync): string | null {
   try {
-    const lines = parseExactTmuxAuthorityLines(execTmuxSync(['list-panes', '-a', '-F', '#{pane_id}\t#{pane_start_command}']));
+    const format = '#{pane_id}|#{pane_start_command}';
+    const lines = parseExactTmuxAuthorityLines(execTmuxSync(['list-panes', '-a', '-F', format]));
     if (!lines) return null;
     let candidate: string | null = null;
     const seen = new Set<string>();
     for (const rawLine of lines) {
-      const fields = rawLine.split('\t');
-      if (fields.length !== 2) return null;
-      const paneId = parseCanonicalTmuxPaneId(fields[0]);
-      if (!paneId || paneId !== fields[0] || seen.has(paneId)) return null;
+      const separatorIndex = rawLine.indexOf('|');
+      if (separatorIndex < 1) return null;
+      const rawPaneId = rawLine.slice(0, separatorIndex);
+      const paneId = parseCanonicalTmuxPaneId(rawPaneId);
+      if (!paneId || paneId !== rawPaneId || seen.has(paneId)) return null;
       seen.add(paneId);
-      const command = fields[1] ?? '';
+      const command = rawLine.slice(separatorIndex + 1);
       if (!hasHudSplitOperationMarker(command, marker)) continue;
       if (candidate) return null;
       candidate = paneId;
@@ -1501,6 +1783,7 @@ export function createHudWatchPane(
     heightLines?: number;
     fullWidth?: boolean;
     targetPaneId?: string;
+    authority?: HudTmuxMutationAuthority;
   } = {},
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): string | null {
@@ -1508,6 +1791,15 @@ export function createHudWatchPane(
   if (options.targetPaneId && !canonicalTargetPaneId) return null;
   const sourceAuthority = readHudSplitSourceAuthority(canonicalTargetPaneId, execTmuxSync);
   if (!sourceAuthority) return null;
+  const mutationAuthority = options.authority ? normalizeHudMutationAuthority(options.authority) : null;
+  if (
+    options.authority
+    && (
+      !mutationAuthority
+      || mutationAuthority.leaderPaneId !== sourceAuthority.paneId
+      || mutationAuthority.leaderPanePid !== sourceAuthority.panePid
+    )
+  ) return null;
   const sourcePaneId = sourceAuthority.paneId;
   const globalBefore = readCanonicalPaneIdSnapshot(execTmuxSync, undefined, true);
   const targetBefore = readCanonicalPaneIdSnapshot(execTmuxSync, sourcePaneId);
@@ -1531,7 +1823,11 @@ export function createHudWatchPane(
     if (readTmuxOptionExactly(execTmuxSync, proofOption) !== provisionalProof) return null;
 
     const splitOutput = execTmuxSync([
-      'if-shell', '-F', '-t', sourcePaneId, buildHudSplitSourceCondition(sourceAuthority),
+      'if-shell', '-F', '-t', sourcePaneId,
+      combineTmuxConditions(
+        buildHudSplitSourceCondition(sourceAuthority),
+        ...(mutationAuthority ? [buildHudMutationAuthorityCondition(mutationAuthority)] : []),
+      ),
       `${splitCommand} ; display-message -p ${receipt}`,
       `display-message -p __omx_hud_split_rejected_${receipt}`,
     ]);
@@ -1628,10 +1924,10 @@ function readHudPaneSessionAndWindow(
 ): { sessionId: string; windowId: string } | null {
   try {
     const value = parseExactTmuxAuthorityScalar(execTmuxSync([
-      'display-message', '-p', '-t', paneId, '#{session_id}\t#{window_id}',
+      'display-message', '-p', '-t', paneId, '#{session_id}|#{window_id}',
     ]));
     if (!value) return null;
-    const [sessionId, windowId, ...extra] = value.split('\t');
+    const [sessionId, windowId, ...extra] = value.split('|');
     return !extra.length && isTmuxSessionId(sessionId ?? '') && isTmuxWindowId(windowId ?? '')
       ? { sessionId: sessionId!, windowId: windowId! }
       : null;
@@ -1676,18 +1972,26 @@ function mutateTmuxPaneIfCurrent(
   paneId: string,
   expectedPanePid: string,
   mutation: string,
+  authority: HudTmuxMutationAuthority | undefined,
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
 ): boolean {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
-  if (!canonicalPaneId || !/^[1-9][0-9]*$/.test(expectedPanePid)) return false;
+  const normalizedAuthority = authority ? normalizeHudMutationAuthority(authority) : null;
+  if (!canonicalPaneId || !/^[1-9][0-9]*$/.test(expectedPanePid) || (authority && !normalizedAuthority)) return false;
   const marker = `__omx_hud_mutation_${randomUUID()}`;
   try {
-    const output = execTmuxSync([
+    const targetMutation = [
       'if-shell', '-F', '-t', canonicalPaneId,
       buildHudHookIncarnationCondition(canonicalPaneId, expectedPanePid),
       `${mutation} ; display-message -p ${marker}`,
       `display-message -p __omx_hud_mutation_failed_${marker}`,
-    ]);
+    ];
+    const output = execTmuxSync(normalizedAuthority ? [
+      'if-shell', '-F', '-t', normalizedAuthority.leaderPaneId,
+      buildHudMutationAuthorityCondition(normalizedAuthority),
+      targetMutation.map(shellEscapeSingle).join(' '),
+      `display-message -p __omx_hud_mutation_failed_${marker}`,
+    ] : targetMutation);
     return parseExactTmuxAuthorityScalar(output) === marker;
   } catch {
     return false;
@@ -1698,11 +2002,16 @@ function mutateTmuxPaneIfCurrent(
 export function killTmuxPaneIfCurrent(
   paneId: string,
   expectedPanePid: string,
-  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+  authorityOrExecTmuxSync?: HudTmuxMutationAuthority | TmuxExecSync,
+  maybeExecTmuxSync?: TmuxExecSync,
 ): boolean {
+  const authority = typeof authorityOrExecTmuxSync === 'function' ? undefined : authorityOrExecTmuxSync;
+  const execTmuxSync = typeof authorityOrExecTmuxSync === 'function'
+    ? authorityOrExecTmuxSync
+    : (maybeExecTmuxSync ?? defaultExecTmuxSync);
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
   return canonicalPaneId
-    ? mutateTmuxPaneIfCurrent(canonicalPaneId, expectedPanePid, `kill-pane -t ${canonicalPaneId}`, execTmuxSync)
+    ? mutateTmuxPaneIfCurrent(canonicalPaneId, expectedPanePid, `kill-pane -t ${canonicalPaneId}`, authority, execTmuxSync)
     : false;
 }
 
@@ -1711,14 +2020,36 @@ export function resizeTmuxPaneIfCurrent(
   paneId: string,
   expectedPanePid: string,
   heightLines: number,
-  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+  authorityOrExecTmuxSync?: HudTmuxMutationAuthority | TmuxExecSync,
+  maybeExecTmuxSync?: TmuxExecSync,
 ): boolean {
+  const authority = typeof authorityOrExecTmuxSync === 'function' ? undefined : authorityOrExecTmuxSync;
+  const execTmuxSync = typeof authorityOrExecTmuxSync === 'function'
+    ? authorityOrExecTmuxSync
+    : (maybeExecTmuxSync ?? defaultExecTmuxSync);
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
   if (!canonicalPaneId) return false;
   const height = Number.isFinite(heightLines) && heightLines > 0
     ? Math.floor(heightLines)
     : HUD_TMUX_HEIGHT_LINES;
-  return mutateTmuxPaneIfCurrent(canonicalPaneId, expectedPanePid, `resize-pane -t ${canonicalPaneId} -y ${height}`, execTmuxSync);
+  return mutateTmuxPaneIfCurrent(canonicalPaneId, expectedPanePid, `resize-pane -t ${canonicalPaneId} -y ${height}`, authority, execTmuxSync);
+}
+
+/** 仅在 HUD 与 leader authority 仍匹配时清理 history。 */
+export function clearTmuxPaneHistoryIfCurrent(
+  paneId: string,
+  expectedPanePid: string,
+  authorityOrExecTmuxSync?: HudTmuxMutationAuthority | TmuxExecSync,
+  maybeExecTmuxSync?: TmuxExecSync,
+): boolean {
+  const authority = typeof authorityOrExecTmuxSync === 'function' ? undefined : authorityOrExecTmuxSync;
+  const execTmuxSync = typeof authorityOrExecTmuxSync === 'function'
+    ? authorityOrExecTmuxSync
+    : (maybeExecTmuxSync ?? defaultExecTmuxSync);
+  const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
+  return canonicalPaneId
+    ? mutateTmuxPaneIfCurrent(canonicalPaneId, expectedPanePid, `clear-history -t ${canonicalPaneId}`, authority, execTmuxSync)
+    : false;
 }
 
 export function killTmuxPane(
@@ -1785,25 +2116,56 @@ export function registerHudResizeHook(
   const context = readHudResizeHookContext(canonicalHudPaneId, canonicalLeaderPaneId, execTmuxSync);
   if (!context) return false;
   const expectedOwnerId = (options.env?.OMX_SESSION_ID ?? process.env.OMX_SESSION_ID)?.trim();
+  const repairRegistration = (options.env?.OMX_HUD_WATCH_REPAIR ?? process.env.OMX_HUD_WATCH_REPAIR) === '1';
+  const expectedRepairLeaderPid = options.env?.OMX_HUD_WATCH_LEADER_PID ?? process.env.OMX_HUD_WATCH_LEADER_PID;
+  if (
+    repairRegistration
+    && (!expectedRepairLeaderPid || parsePositiveInteger(expectedRepairLeaderPid) !== Number(context.leaderPanePid))
+  ) return false;
   let ownerId = expectedOwnerId;
+  let observedOwnerId: string | null = null;
   try {
     const observedOwner = parseExactTmuxAuthorityScalar(execTmuxSync([
       'display-message', '-p', '-t', canonicalLeaderPaneId, '#{@omx_instance_id}',
     ]));
     if (observedOwner && /^\S+$/.test(observedOwner)) {
+      if (expectedOwnerId && observedOwner !== expectedOwnerId) return false;
+      observedOwnerId = observedOwner;
       ownerId = observedOwner;
     }
   } catch {
     // Owner fencing remains available from the launch environment when tmux
     // does not expose the session option through this probe.
   }
+  if (repairRegistration && (!expectedOwnerId || observedOwnerId !== expectedOwnerId)) return false;
   const ownedContext = ownerId ? { ...context, ownerId } : context;
+  const mutationAuthority = repairRegistration && ownerId ? normalizeHudMutationAuthority({
+    leaderPaneId: context.leaderPaneId,
+    leaderPanePid: context.leaderPanePid,
+    ownerId,
+  }) ?? undefined : undefined;
+  if (repairRegistration && !mutationAuthority) return false;
   const tmuxBin = resolveTmuxBinaryForPlatform() || 'tmux';
   const height = String(Math.max(1, Math.floor(heightLines)));
   const resizeCmd = shellEscapeSingle(buildHudResizeHookCommand(tmuxBin, canonicalHudPaneId, height, ownedContext, options.env?.TMUX));
   const omxBin = resolveOmxCliEntryPath({ cwd: options.cwd, env: options.env });
   try {
-    execTmuxSync(['set-hook', '-t', ownedContext.sessionId, ownedContext.hookSlot, `run-shell -b ${resizeCmd}`, ...buildHudHookRegistrationSuffix(ownedContext, ownedContext.hookSlot)]);
+    const resizeRegistrationCommand = `run-shell -b ${resizeCmd}`;
+    if (mutationAuthority) {
+      if (!executeHudCommandUnderAuthority(
+        mutationAuthority,
+        buildHudHookRegistrationCommand(
+          ['-t', ownedContext.sessionId],
+          ownedContext.hookSlot,
+          resizeRegistrationCommand,
+          ownedContext,
+        ),
+        execTmuxSync,
+      )) return false;
+    } else {
+      execTmuxSync(['set-hook', '-t', ownedContext.sessionId, ownedContext.hookSlot, resizeRegistrationCommand, ...buildHudHookRegistrationSuffix(ownedContext, ownedContext.hookSlot)]);
+    }
+    if (!recordHudHookExpectedCommand(ownedContext, ownedContext.hookSlot, Number(height), options.cwd?.trim() || process.cwd(), execTmuxSync, mutationAuthority)) return false;
     unregisterLegacyHudResizeHook(ownedContext, execTmuxSync);
   } catch {
     return false;
@@ -1817,7 +2179,17 @@ export function registerHudResizeHook(
         const targetArgs = hookSlot === ownedContext.layoutHookSlot
           ? ['-w', '-t', ownedContext.windowId]
           : ['-t', ownedContext.sessionId];
-        execTmuxSync(['set-hook', ...targetArgs, hookSlot, `run-shell -b ${reconcileCmd}`, ...buildHudHookRegistrationSuffix(ownedContext, hookSlot)]);
+        const registrationCommand = `run-shell -b ${reconcileCmd}`;
+        if (mutationAuthority) {
+          if (!executeHudCommandUnderAuthority(
+            mutationAuthority,
+            buildHudHookRegistrationCommand(targetArgs, hookSlot, registrationCommand, ownedContext),
+            execTmuxSync,
+          )) return false;
+        } else {
+          execTmuxSync(['set-hook', ...targetArgs, hookSlot, registrationCommand, ...buildHudHookRegistrationSuffix(ownedContext, hookSlot)]);
+        }
+        if (!recordHudHookExpectedCommand(ownedContext, hookSlot, Number(height), options.cwd?.trim() || process.cwd(), execTmuxSync, mutationAuthority)) return false;
       }
     } catch {
       // Keep the resize hook installed so older tmux builds still recover on
@@ -1848,13 +2220,23 @@ export function isHudOwnerCurrent(
 
 export function unregisterHudResizeHook(
   leaderPaneId: string | undefined,
-  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+  authorityOrExecTmuxSync?: HudTmuxMutationAuthority | TmuxExecSync,
+  maybeExecTmuxSync?: TmuxExecSync,
 ): boolean {
+  const authority = typeof authorityOrExecTmuxSync === 'function' ? undefined : authorityOrExecTmuxSync;
+  const execTmuxSync = typeof authorityOrExecTmuxSync === 'function'
+    ? authorityOrExecTmuxSync
+    : (maybeExecTmuxSync ?? defaultExecTmuxSync);
   const canonicalLeaderPaneId = parseCanonicalTmuxPaneId(leaderPaneId);
-  if (!canonicalLeaderPaneId) return false;
+  const normalizedAuthority = authority ? normalizeHudMutationAuthority(authority) ?? undefined : undefined;
+  if (
+    !canonicalLeaderPaneId
+    || (authority && !normalizedAuthority)
+    || (normalizedAuthority && normalizedAuthority.leaderPaneId !== canonicalLeaderPaneId)
+  ) return false;
   let contextOutput: string;
   try {
-    contextOutput = execTmuxSync(['display-message', '-p', '-t', canonicalLeaderPaneId, '#{session_id}\t#{window_id}']);
+    contextOutput = execTmuxSync(['display-message', '-p', '-t', canonicalLeaderPaneId, '#{session_id}|#{window_id}']);
   } catch {
     return false;
   }
@@ -1868,13 +2250,19 @@ export function unregisterHudResizeHook(
   let ok = true;
   try {
     unregisterLegacyHudResizeHook(context, execTmuxSync);
-    execTmuxSync(buildGuardedHudHookUnregisterArgs(context, context.hookSlot));
+    const marker = `__omx_hud_unregister_${randomUUID()}`;
+    if (parseExactTmuxAuthorityScalar(execTmuxSync(
+      buildGuardedHudHookUnregisterArgs(context, context.hookSlot, marker, normalizedAuthority),
+    )) !== marker) ok = false;
   } catch {
     ok = false;
   }
   for (const hookSlot of [context.splitHookSlot, context.layoutHookSlot]) {
     try {
-      execTmuxSync(buildGuardedHudHookUnregisterArgs(context, hookSlot));
+      const marker = `__omx_hud_unregister_${randomUUID()}`;
+      if (parseExactTmuxAuthorityScalar(execTmuxSync(
+        buildGuardedHudHookUnregisterArgs(context, hookSlot, marker, normalizedAuthority),
+      )) !== marker) ok = false;
     } catch {
       ok = false;
     }

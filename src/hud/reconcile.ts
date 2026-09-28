@@ -13,18 +13,74 @@ import {
   findHudWatchPaneIds,
   isHudWatchPane,
   killTmuxPane,
+  killTmuxPaneIfCurrent,
   listCurrentWindowPanes,
+  parseCanonicalTmuxPaneId,
+  readHudLeaderOwnerIdentity,
   readCurrentWindowSize,
   readHudPaneOwner,
   registerHudResizeHook,
   unregisterHudResizeHook,
   resizeTmuxPane,
+  resizeTmuxPaneIfCurrent,
+  type HudTmuxMutationAuthority,
   type HudPaneOwner,
   type TmuxPaneSnapshot,
 } from './tmux.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 
 export const OMX_TMUX_HUD_OWNER_ENV = 'OMX_TMUX_HUD_OWNER';
+
+export type HudLayoutAssessment =
+  | { status: 'healthy'; reason: 'verified' }
+  | { status: 'repair_needed'; reason: 'missing_hud' | 'duplicate_hud' | 'stale_hud' | 'orphaned_hud' | 'misplaced_hud' | 'height_mismatch' }
+  | { status: 'unknown'; reason: 'invalid_identity' | 'incomplete_snapshot' | 'incomplete_geometry' };
+
+/** 只使用经过 tmux 快照校验的 pane 数据判断 HUD 布局。 */
+export function assessOwnedHudLayout(
+  panes: TmuxPaneSnapshot[],
+  leaderPaneId: string,
+  hudPaneId: string,
+  sessionId: string,
+  desiredHeight: number,
+): HudLayoutAssessment {
+  if (!parseCanonicalTmuxPaneId(leaderPaneId) || !parseCanonicalTmuxPaneId(hudPaneId) || !sessionId.trim()) {
+    return { status: 'unknown', reason: 'invalid_identity' };
+  }
+  if (panes.length === 0) return { status: 'unknown', reason: 'incomplete_snapshot' };
+  const leader = panes.find(pane => pane.paneId === leaderPaneId);
+  if (!leader || leader.paneDead || isHudWatchPane(leader)) {
+    return { status: 'unknown', reason: 'incomplete_snapshot' };
+  }
+  const hud = panes.find(pane => pane.paneId === hudPaneId);
+  const owned = findHudWatchPaneIds(panes, leaderPaneId, { sessionId, leaderPaneId });
+  const legacy = findLegacyFocusedHudWatchPaneIds(panes, leaderPaneId);
+  if (owned.length + legacy.length > 1) return { status: 'repair_needed', reason: 'duplicate_hud' };
+  const stale = panes.some(pane => isHudWatchPane(pane)
+    && readHudPaneOwner(pane).leaderPaneId === leaderPaneId
+    && readHudPaneOwner(pane).sessionId !== sessionId);
+  if (stale) return { status: 'repair_needed', reason: 'stale_hud' };
+  const liveLeaders = new Set(panes.filter(pane => !isHudWatchPane(pane) && !pane.paneDead)
+    .map(pane => pane.paneId));
+  const orphaned = panes.some(pane => {
+    if (!isHudWatchPane(pane)) return false;
+    const owner = readHudPaneOwner(pane);
+    return owner.sessionId === sessionId && owner.leaderPaneId && !liveLeaders.has(owner.leaderPaneId);
+  });
+  if (orphaned) return { status: 'repair_needed', reason: 'orphaned_hud' };
+  if (!hud) return { status: 'repair_needed', reason: 'missing_hud' };
+  if (owned.length !== 1 || owned[0] !== hudPaneId) return { status: 'repair_needed', reason: 'misplaced_hud' };
+  if (
+    [leader, hud].some(pane => pane.paneDead || !pane.panePid
+      || pane.paneLeft === undefined || pane.paneTop === undefined
+      || pane.paneWidth === undefined || pane.paneHeight === undefined
+      || pane.paneBottom === undefined || pane.windowWidth === undefined
+      || pane.windowHeight === undefined)
+  ) return { status: 'unknown', reason: 'incomplete_geometry' };
+  if (needsHudTopologyRecreate(hud, leader)) return { status: 'repair_needed', reason: 'misplaced_hud' };
+  if (hud.paneHeight !== desiredHeight) return { status: 'repair_needed', reason: 'height_mismatch' };
+  return { status: 'healthy', reason: 'verified' };
+}
 
 function isExplicitOmxOwnedTmuxEnv(env: NodeJS.ProcessEnv): boolean {
   return env[OMX_TMUX_HUD_OWNER_ENV] === '1';
@@ -158,6 +214,7 @@ export interface ReconcileHudForPromptSubmitDeps {
   readCurrentWindowSize?: (currentPaneId?: string) => { width: number | null; height: number | null };
   nowMs?: () => number;
   isProcessLive?: (pid: number) => boolean | null;
+  readHudLeaderOwnerIdentity?: typeof readHudLeaderOwnerIdentity;
 }
 
 function ensureHudResizeHook(
@@ -449,11 +506,39 @@ export async function reconcileHudForPromptSubmit(
   }
 
   const listPanes = deps.listCurrentWindowPanes ?? ((paneId) => listCurrentWindowPanes(undefined, paneId));
-  const createPane = deps.createHudWatchPane ?? ((hudCwd, hudCmd, options) => createHudWatchPane(hudCwd, hudCmd, options));
-  const killPane = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
-  const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
+  const createPaneRaw = deps.createHudWatchPane ?? ((hudCwd, hudCmd, options) => createHudWatchPane(hudCwd, hudCmd, {
+    ...options, ...(watchRepair && mutationAuthority ? { authority: mutationAuthority } : {}),
+  }));
+  const killPaneRaw = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
+  const resizePaneRaw = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
   const currentPaneId = env.TMUX_PANE?.trim();
   const resolvedSessionId = deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
+  const watchRepair = env.OMX_HUD_WATCH_REPAIR === '1';
+  const expectedLeaderPid = env.OMX_HUD_WATCH_LEADER_PID?.trim();
+  const mutationAuthority: HudTmuxMutationAuthority | null = watchRepair && currentPaneId && expectedLeaderPid && resolvedSessionId
+    ? { leaderPaneId: currentPaneId, leaderPanePid: expectedLeaderPid, ownerId: resolvedSessionId }
+    : null;
+  const watchRepairAuthorized = (): boolean => {
+    if (!watchRepair) return true;
+    if (!currentPaneId || !resolvedSessionId || !expectedLeaderPid || !/^[1-9][0-9]*$/.test(expectedLeaderPid)) return false;
+    if ((deps.readHudLeaderOwnerIdentity ?? readHudLeaderOwnerIdentity)(currentPaneId, resolvedSessionId) !== 'current') return false;
+    return listPanes(currentPaneId).some(pane => pane.paneId === currentPaneId
+      && pane.panePid === expectedLeaderPid && !pane.paneDead && !isHudWatchPane(pane));
+  };
+  const createPane: typeof createPaneRaw = (hudCwd, hudCmd, options) => watchRepairAuthorized()
+    ? createPaneRaw(hudCwd, hudCmd, options) : null;
+  const killPane: typeof killPaneRaw = paneId => {
+    if (!watchRepairAuthorized()) return false;
+    if (!watchRepair || deps.killTmuxPane) return killPaneRaw(paneId);
+    const targetPid = listPanes(currentPaneId).find(pane => pane.paneId === paneId)?.panePid;
+    return targetPid && mutationAuthority ? killTmuxPaneIfCurrent(paneId, targetPid, mutationAuthority) : false;
+  };
+  const resizePane: typeof resizePaneRaw = (paneId, lines) => {
+    if (!watchRepairAuthorized()) return false;
+    if (!watchRepair || deps.resizeTmuxPane) return resizePaneRaw(paneId, lines);
+    const targetPid = listPanes(currentPaneId).find(pane => pane.paneId === paneId)?.panePid;
+    return targetPid && mutationAuthority ? resizeTmuxPaneIfCurrent(paneId, targetPid, lines, mutationAuthority) : false;
+  };
   const equivalentSessionIds = [
     resolvedSessionId,
     env.OMX_SESSION_ID?.trim(),
@@ -481,7 +566,7 @@ export async function reconcileHudForPromptSubmit(
     )
     : null;
   if (lockDirReady && !lock) {
-    rearmHudResizeHookAfterConcurrentSkip(cwd, currentPaneId, owner, listPanes, deps);
+    if (watchRepairAuthorized()) rearmHudResizeHookAfterConcurrentSkip(cwd, currentPaneId, owner, listPanes, deps);
     return {
       status: 'skipped_concurrent',
       paneId: null,
@@ -510,6 +595,9 @@ export async function reconcileHudForPromptSubmit(
         duplicateCount: 0,
       };
     }
+  }
+  if (!watchRepairAuthorized()) {
+    return { status: 'skipped_stale_leader_pane', paneId: null, desiredHeight: null, duplicateCount: 0 };
   }
 
   // Reclaim orphaned HUD panes left behind by a destroyed leader before deciding
@@ -570,7 +658,7 @@ export async function reconcileHudForPromptSubmit(
     desiredHeight = boundHudHeight(requestedHeight, panes, currentPaneId, singleHudPane.paneId);
     const shouldResize = needsHudHeightResize(singleHudPane, desiredHeight);
     const resized = shouldResize ? resizePane(singleHudPane.paneId, desiredHeight) : true;
-    if (resized) ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+    if (resized && watchRepairAuthorized()) ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
     return {
       status: resized ? (shouldResize ? 'resized' : 'unchanged') : 'failed',
       paneId: singleHudPane.paneId,
@@ -591,7 +679,7 @@ export async function reconcileHudForPromptSubmit(
       }
       desiredHeight = boundHudHeight(requestedHeight, listPanes(currentPaneId), currentPaneId, keeperPane.paneId);
       const resized = resizePane(keeperPane.paneId, desiredHeight);
-      if (resized) ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+      if (resized && watchRepairAuthorized()) ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
       return {
         status: resized ? 'replaced_duplicates' : 'failed',
         paneId: keeperPane.paneId,
@@ -634,15 +722,17 @@ export async function reconcileHudForPromptSubmit(
   }
 
   const unregisterHook = deps.unregisterHudResizeHook ?? unregisterHudResizeHook;
-  unregisterHook(currentPaneId);
-
-  const removedHudPaneIds = new Set<string>();
-  for (const paneId of hudPaneIds) {
-    if (killPane(paneId)) removedHudPaneIds.add(paneId);
+  if (!watchRepairAuthorized()) {
+    return { status: 'skipped_stale_leader_pane', paneId: null, desiredHeight, duplicateCount };
+  }
+  if (watchRepair && !deps.unregisterHudResizeHook) {
+    if (!mutationAuthority || !unregisterHudResizeHook(currentPaneId, mutationAuthority)) {
+      return { status: 'failed', paneId: null, desiredHeight, duplicateCount };
+    }
+  } else {
+    unregisterHook(currentPaneId);
   }
 
-  // Removing malformed HUDs changes the layout; a fresh split only owns leader space.
-  if (removedHudPaneIds.size > 0) desiredHeight = boundHudHeight(requestedHeight, listPanes(currentPaneId), currentPaneId);
   const createOptions: { heightLines: number; fullWidth?: boolean; targetPaneId?: string } = {
     heightLines: desiredHeight,
     targetPaneId: currentPaneId,
@@ -657,6 +747,12 @@ export async function reconcileHudForPromptSubmit(
       duplicateCount,
     };
   }
+
+  const removedHudPaneIds = new Set<string>();
+  for (const oldPaneId of hudPaneIds) {
+    if (oldPaneId !== paneId && killPane(oldPaneId)) removedHudPaneIds.add(oldPaneId);
+  }
+  if (removedHudPaneIds.size > 0) desiredHeight = boundHudHeight(requestedHeight, listPanes(currentPaneId), currentPaneId, paneId);
 
   // A launch-path restore and prompt-submit reconciliation can both observe
   // "no HUD" before either split-window has materialized. Re-scan after create
@@ -680,7 +776,7 @@ export async function reconcileHudForPromptSubmit(
       duplicateCount: postCreate.duplicatePaneIds.length,
     };
   }
-  ensureHudResizeHook(postCreate.paneId, currentPaneId, desiredHeight, cwd, deps);
+  if (watchRepairAuthorized()) ensureHudResizeHook(postCreate.paneId, currentPaneId, desiredHeight, cwd, deps);
 
   return {
     status: postCreate.duplicatePaneIds.length > 0 || hudPaneIds.length > 1 ? 'replaced_duplicates' : 'recreated',

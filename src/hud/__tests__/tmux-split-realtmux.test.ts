@@ -8,6 +8,7 @@ import {
   findHudSplitOperationMarkerPaneId,
   findHudWatchPaneIds,
   listCurrentWindowPanes,
+  readHudHookHealth,
   registerHudResizeHook,
 } from '../tmux.js';
 import { isRealTmuxAvailable, type TempTmuxSessionFixture, withTempTmuxSession } from '../../team/__tests__/tmux-test-fixture.js';
@@ -121,6 +122,133 @@ async function waitForRegisteredLayoutHooks(fixture: TempTmuxSessionFixture): Pr
   throw new Error(`timed out waiting for split and window layout hooks: ${lastHooks}`);
 }
 
+async function waitForPaneToDisappear(
+  fixture: TempTmuxSessionFixture,
+  paneId: string,
+  operation: string,
+): Promise<void> {
+  const deadline = Date.now() + HUD_RECONCILE_TIMEOUT_MS;
+  let lastPaneIds = '';
+  while (Date.now() < deadline) {
+    lastPaneIds = fixture.run(['list-panes', '-a', '-F', '#{pane_id}']);
+    if (!lastPaneIds.split('\n').includes(paneId)) return;
+    await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
+  }
+  throw new Error(`timed out waiting for the old HUD watcher to retire after ${operation}: ${lastPaneIds}`);
+}
+
+function createOwnedHud(
+  fixture: TempTmuxSessionFixture,
+  workDir: string,
+  sessionId: string,
+): { hudPaneId: string; omxEntry: string } {
+  const omxEntry = join(process.cwd(), 'dist', 'cli', 'omx.js');
+  const hudCommand = [
+    'exec',
+    'env',
+    'OMX_TMUX_HUD_OWNER=1',
+    `OMX_SESSION_ID=${quoteSh(sessionId)}`,
+    `OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)}`,
+    `OMX_ROOT=${quoteSh(workDir)}`,
+    `OMX_ENTRY_PATH=${quoteSh(omxEntry)}`,
+    `OMX_STARTUP_CWD=${quoteSh(process.cwd())}`,
+    quoteSh(process.execPath),
+    quoteSh(omxEntry),
+    'hud',
+    '--watch',
+  ].join(' ');
+  const hudPaneId = fixture.run([
+    'split-window', '-d', '-P', '-F', '#{pane_id}', '-v', '-l', '2',
+    '-c', workDir, '-t', fixture.leaderPaneId, hudCommand,
+  ]);
+  return { hudPaneId, omxEntry };
+}
+
+function registerOwnedHudHooks(
+  fixture: TempTmuxSessionFixture,
+  workDir: string,
+  sessionId: string,
+  hudPaneId: string,
+  omxEntry: string,
+): void {
+  fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', sessionId]);
+  assert.equal(registerHudResizeHook(
+    hudPaneId,
+    fixture.leaderPaneId,
+    2,
+    {
+      cwd: workDir,
+      env: {
+        ...process.env,
+        ...fixture.env,
+        OMX_ENTRY_PATH: omxEntry,
+        OMX_STARTUP_CWD: process.cwd(),
+        OMX_SESSION_ID: sessionId,
+        OMX_ROOT: workDir,
+      },
+    },
+  ), true);
+}
+
+function assertPaneExists(fixture: TempTmuxSessionFixture, paneId: string, message: string): void {
+  const paneIds = fixture.run(['list-panes', '-a', '-F', '#{pane_id}']).split('\n');
+  assert.ok(paneIds.includes(paneId), message);
+}
+
+async function waitForOwnedHudHooksHealthy(
+  fixture: TempTmuxSessionFixture,
+  workDir: string,
+  sessionId: string,
+  hudPaneId: string,
+  omxEntry: string,
+): Promise<void> {
+  const deadline = Date.now() + HUD_RECONCILE_TIMEOUT_MS;
+  let lastHealth = 'unknown';
+  let lastProbe = '';
+  while (Date.now() < deadline) {
+    const panes = listCurrentWindowPanes(undefined, fixture.leaderPaneId);
+    const leader = panes.find((pane) => pane.paneId === fixture.leaderPaneId);
+    const hud = panes.find((pane) => pane.paneId === hudPaneId);
+    if (leader?.panePid && leader.sessionId && leader.windowId && hud?.panePid && hud.paneHeight) {
+      lastHealth = readHudHookHealth({
+        leaderPaneId: fixture.leaderPaneId,
+        leaderPanePid: leader.panePid,
+        hudPaneId,
+        hudPanePid: hud.panePid,
+        sessionId: leader.sessionId,
+        windowId: leader.windowId,
+        heightLines: hud.paneHeight,
+        cwd: workDir,
+        env: {
+          ...process.env,
+          ...fixture.env,
+          OMX_ENTRY_PATH: omxEntry,
+          OMX_STARTUP_CWD: process.cwd(),
+          OMX_SESSION_ID: sessionId,
+          OMX_ROOT: workDir,
+        },
+      }, (args) => {
+        const output = fixture.run(args);
+        if (args[0] === 'display-message' && args.at(-1)?.includes('@omx_hook_identity_')) {
+          lastProbe = output;
+        }
+        return `${output}\n`;
+      });
+      if (lastHealth === 'healthy') return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
+  }
+  const hookOutput = `${fixture.run(['show-hooks', '-t', fixture.sessionName])}\n${fixture.run(['show-hooks', '-w', '-t', fixture.leaderPaneId])}`;
+  const hookSlots = [...hookOutput.matchAll(/^(client-resized|window-layout-changed|after-split-window)\[([0-9]+)\]/gmu)]
+    .map((match) => `${match[1]}[${match[2]}]`)
+    .filter((slot, index, slots) => slots.indexOf(slot) === index);
+  const hookEquality = hookSlots.map((slot) => {
+    const option = `@omx_hook_expected_${slot.slice(0, slot.indexOf('[')).replaceAll('-', '_')}_${slot.slice(slot.indexOf('[') + 1, -1)}`;
+    return `${slot}:${fixture.run(['display-message', '-p', '-t', fixture.leaderPaneId, `#{?#{==:#{${slot}},#{${option}}},1,0}`])}`;
+  }).join(',');
+  throw new Error(`timed out waiting for healthy owned HUD hooks: ${lastHealth} (${lastProbe}; ${hookEquality})`);
+}
+
 describe('createHudWatchPane real private-server split transaction', () => {
   it('creates a marker-tagged HUD pane and round-trips the tmux 3.2a pane_start_command', async (t) => {
     if (!skipUnlessPrivateRealTmux(t)) return;
@@ -144,8 +272,8 @@ describe('createHudWatchPane real private-server split transaction', () => {
           const paneId = createHudWatchPane(workDir, hudCmd, { targetPaneId: fixture.leaderPaneId });
           assert.ok(paneId, 'guarded split must create the HUD pane and emit its receipt');
 
-          const panes = fixture.run(['list-panes', '-a', '-F', '#{pane_id}\t#{pane_start_command}']);
-          const paneRow = panes.split('\n').find((row) => row.startsWith(`${paneId}\t`));
+          const panes = fixture.run(['list-panes', '-a', '-F', '#{pane_id}|#{pane_start_command}']);
+          const paneRow = panes.split('\n').find((row) => row.startsWith(`${paneId}|`));
           assert.ok(paneRow, 'created HUD pane must exist on the private server');
 
           const marker = await waitForFileContent(envFile);
@@ -211,9 +339,10 @@ describe('createHudWatchPane real private-server split transaction', () => {
         ].join(' ');
         const oldHudPaneId = fixture.run([
           'split-window', '-d', '-P', '-F', '#{pane_id}', '-v', '-l', '2',
-          '-t', fixture.leaderPaneId, hudCommand,
+          '-c', workDir, '-t', fixture.leaderPaneId, hudCommand,
         ]);
         await waitForPaneReady(fixture, oldHudPaneId);
+        fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', sessionId]);
 
         assert.equal(registerHudResizeHook(
           oldHudPaneId,
@@ -237,6 +366,7 @@ describe('createHudWatchPane real private-server split transaction', () => {
         const newHudPaneId = await waitForReconciledHud(fixture.leaderPaneId, oldHudPaneId, sessionId);
 
         assert.notEqual(newHudPaneId, oldHudPaneId);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, newHudPaneId, omxEntry);
         assert.match(
           fixture.run(['show-hooks', '-t', fixture.sessionName]),
           /^after-split-window\[/m,
@@ -275,10 +405,11 @@ describe('createHudWatchPane real private-server split transaction', () => {
           ].join(' ');
           const hudPaneId = fixture.run([
             'split-window', '-d', '-P', '-F', '#{pane_id}', '-v', '-l', '2',
-            '-t', fixture.leaderPaneId, hudCommand,
+            '-c', workDir, '-t', fixture.leaderPaneId, hudCommand,
           ]);
           await waitForPaneReady(fixture, peerPaneId);
           await waitForPaneReady(fixture, hudPaneId);
+          fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', sessionId]);
 
           assert.equal(registerHudResizeHook(
             hudPaneId,
@@ -325,4 +456,183 @@ describe('createHudWatchPane real private-server split transaction', () => {
       }
     });
   }
+
+  it('moves an owned HUD to another window, retires the old watcher, and keeps unrelated panes', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+
+    const workDir = await mkdtemp(join(tmpdir(), 'omx-hud-cross-window-realtmux-'));
+    try {
+      await withTempTmuxSession({ serverLog: true }, async (fixture) => {
+        const sessionId = `omx-hud-cross-window-${process.pid}`;
+        const destinationPaneId = fixture.run([
+          'new-window', '-d', '-P', '-F', '#{pane_id}',
+          '-t', fixture.sessionName, 'sleep 300',
+        ]);
+        fixture.run(['resize-window', '-t', fixture.leaderPaneId, '-x', '90', '-y', '70']);
+        fixture.run(['resize-window', '-t', destinationPaneId, '-x', '90', '-y', '70']);
+        const { hudPaneId, omxEntry } = createOwnedHud(fixture, workDir, sessionId);
+        registerOwnedHudHooks(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        await waitForPaneReady(fixture, destinationPaneId);
+        await waitForPaneReady(fixture, hudPaneId);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, hudPaneId, omxEntry);
+
+        fixture.run(['move-pane', '-d', '-v', '-s', hudPaneId, '-t', destinationPaneId]);
+
+        const replacementPaneId = await waitForReconciledHud(
+          fixture.leaderPaneId,
+          hudPaneId,
+          sessionId,
+          'moving the owned HUD to another window',
+        );
+        await waitForPaneToDisappear(fixture, hudPaneId, 'moving the owned HUD to another window');
+        await waitForRegisteredLayoutHooks(fixture);
+        const leaderWindowPanes = listCurrentWindowPanes(undefined, fixture.leaderPaneId);
+        assert.deepEqual(
+          findHudWatchPaneIds(leaderWindowPanes, fixture.leaderPaneId, {
+            leaderPaneId: fixture.leaderPaneId,
+            sessionId,
+          }),
+          [replacementPaneId],
+          'the leader window must contain exactly one healthy owned HUD',
+        );
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, replacementPaneId, omxEntry);
+        assertPaneExists(fixture, destinationPaneId, 'the unrelated destination pane must remain alive');
+        assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
+      });
+    } finally {
+      await removeTempDirWithRetry(workDir);
+    }
+  });
+
+  it('moves the leader to another window, retires its old HUD, and keeps unrelated panes', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+
+    const workDir = await mkdtemp(join(tmpdir(), 'omx-hud-leader-window-realtmux-'));
+    try {
+      await withTempTmuxSession({ serverLog: true }, async (fixture) => {
+        const sessionId = `omx-hud-leader-window-${process.pid}`;
+        const sourcePeerPaneId = fixture.run([
+          'split-window', '-d', '-P', '-F', '#{pane_id}', '-h',
+          '-t', fixture.leaderPaneId, 'sleep 300',
+        ]);
+        const destinationPaneId = fixture.run([
+          'new-window', '-d', '-P', '-F', '#{pane_id}',
+          '-t', fixture.sessionName, 'sleep 300',
+        ]);
+        fixture.run(['resize-window', '-t', fixture.leaderPaneId, '-x', '90', '-y', '70']);
+        fixture.run(['resize-window', '-t', destinationPaneId, '-x', '90', '-y', '70']);
+        const { hudPaneId, omxEntry } = createOwnedHud(fixture, workDir, sessionId);
+        registerOwnedHudHooks(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        await waitForPaneReady(fixture, sourcePeerPaneId);
+        await waitForPaneReady(fixture, destinationPaneId);
+        await waitForPaneReady(fixture, hudPaneId);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, hudPaneId, omxEntry);
+
+        fixture.run(['move-pane', '-d', '-h', '-s', fixture.leaderPaneId, '-t', destinationPaneId]);
+
+        const replacementPaneId = await waitForReconciledHud(
+          fixture.leaderPaneId,
+          hudPaneId,
+          sessionId,
+          'moving the leader to another window',
+        );
+        await waitForPaneToDisappear(fixture, hudPaneId, 'moving the leader to another window');
+        await waitForRegisteredLayoutHooks(fixture);
+        const leaderWindowPanes = listCurrentWindowPanes(undefined, fixture.leaderPaneId);
+        assert.deepEqual(
+          findHudWatchPaneIds(leaderWindowPanes, fixture.leaderPaneId, {
+            leaderPaneId: fixture.leaderPaneId,
+            sessionId,
+          }),
+          [replacementPaneId],
+          'the moved leader must contain exactly one healthy owned HUD',
+        );
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, replacementPaneId, omxEntry);
+        assertPaneExists(fixture, sourcePeerPaneId, 'the unrelated source pane must remain alive');
+        assertPaneExists(fixture, destinationPaneId, 'the unrelated destination pane must remain alive');
+        assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
+      });
+    } finally {
+      await removeTempDirWithRetry(workDir);
+    }
+  });
+
+  it('rearms a missing layout hook without replacing a correctly placed HUD', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+
+    const workDir = await mkdtemp(join(tmpdir(), 'omx-hud-hook-health-realtmux-'));
+    try {
+      await withTempTmuxSession({ serverLog: true }, async (fixture) => {
+        const sessionId = `omx-hud-hook-health-${process.pid}`;
+        const { hudPaneId, omxEntry } = createOwnedHud(fixture, workDir, sessionId);
+        registerOwnedHudHooks(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        await waitForPaneReady(fixture, hudPaneId);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        const layoutHook = fixture.run(['show-hooks', '-w', '-t', fixture.leaderPaneId])
+          .split('\n')
+          .map((line) => line.match(/^(window-layout-changed\[[^\]]+\])/u)?.[1])
+          .find((hook): hook is string => typeof hook === 'string');
+        assert.ok(layoutHook, 'the owned HUD must publish its window layout hook');
+
+        fixture.run(['set-hook', '-u', '-w', '-t', fixture.leaderPaneId, layoutHook]);
+        await waitForRegisteredLayoutHooks(fixture);
+
+        assertPaneExists(fixture, hudPaneId, 'hook recovery must preserve the correctly placed HUD pane');
+        const panes = listCurrentWindowPanes(undefined, fixture.leaderPaneId);
+        assert.deepEqual(
+          findHudWatchPaneIds(panes, fixture.leaderPaneId, {
+            leaderPaneId: fixture.leaderPaneId,
+            sessionId,
+          }),
+          [hudPaneId],
+          'hook recovery must retain one owned HUD',
+        );
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
+      });
+    } finally {
+      await removeTempDirWithRetry(workDir);
+    }
+  });
+
+  it('uses the watcher fallback to recover a swapped HUD when its layout hook is absent', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+
+    const workDir = await mkdtemp(join(tmpdir(), 'omx-hud-no-event-swap-realtmux-'));
+    try {
+      await withTempTmuxSession({ serverLog: true }, async (fixture) => {
+        const sessionId = `omx-hud-no-event-swap-${process.pid}`;
+        const peerPaneId = fixture.run([
+          'split-window', '-d', '-P', '-F', '#{pane_id}', '-h',
+          '-t', fixture.leaderPaneId, 'sleep 300',
+        ]);
+        const { hudPaneId, omxEntry } = createOwnedHud(fixture, workDir, sessionId);
+        registerOwnedHudHooks(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        await waitForPaneReady(fixture, peerPaneId);
+        await waitForPaneReady(fixture, hudPaneId);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        const layoutHook = fixture.run(['show-hooks', '-w', '-t', fixture.leaderPaneId])
+          .split('\n')
+          .map((line) => line.match(/^(window-layout-changed\[[^\]]+\])/u)?.[1])
+          .find((hook): hook is string => typeof hook === 'string');
+        assert.ok(layoutHook, 'the owned HUD must publish its window layout hook');
+        fixture.run(['set-hook', '-u', '-w', '-t', fixture.leaderPaneId, layoutHook]);
+
+        fixture.run(['swap-pane', '-d', '-s', hudPaneId, '-t', peerPaneId]);
+
+        const replacementPaneId = await waitForReconciledHud(
+          fixture.leaderPaneId,
+          hudPaneId,
+          sessionId,
+          'a swap with no layout hook',
+        );
+        assert.notEqual(replacementPaneId, hudPaneId);
+        await waitForRegisteredLayoutHooks(fixture);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, replacementPaneId, omxEntry);
+        assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
+      });
+    } finally {
+      await removeTempDirWithRetry(workDir);
+    }
+  });
 });
