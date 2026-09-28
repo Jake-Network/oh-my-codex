@@ -12,6 +12,8 @@ import {
   registerHudResizeHook,
 } from '../tmux.js';
 import { isRealTmuxAvailable, type TempTmuxSessionFixture, withTempTmuxSession } from '../../team/__tests__/tmux-test-fixture.js';
+import { dispatchCodexNativeHook } from '../../scripts/codex-native-hook.js';
+import { HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES } from '../constants.js';
 
 const PANE_READY_TIMEOUT_MS = 1_000;
 const PANE_READY_INTERVAL_MS = 50;
@@ -250,6 +252,92 @@ async function waitForOwnedHudHooksHealthy(
 }
 
 describe('createHudWatchPane real private-server split transaction', () => {
+  it('creates one healthy HUD after a cramped window grows and retires it when ownership changes', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+
+    const workDir = await mkdtemp(join(tmpdir(), 'omx-hud-native-hook-realtmux-'));
+    const binDir = join(workDir, 'bin');
+    const sessionId = `omx-hud-native-hook-${process.pid}`;
+    const omxEntry = join(process.cwd(), 'dist', 'cli', 'omx.js');
+    const envKeys = [
+      'PATH', 'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT',
+      'OMX_SESSION_ID', 'OMX_TMUX_HUD_OWNER', 'OMX_TMUX_HUD_LEADER_PANE',
+      'OMX_ENTRY_PATH', 'OMX_STARTUP_CWD', 'OMX_NATIVE_HOOK_DOCTOR_SMOKE',
+    ] as const;
+    const previousEnv = envKeys.map((key) => process.env[key]);
+    try {
+      await mkdir(binDir, { recursive: true });
+      await withTempTmuxSession({ serverLog: true }, async (fixture) => {
+        await fixture.createPathShim(binDir);
+        process.env.PATH = `${binDir}:${previousEnv[0] ?? ''}`;
+        process.env.OMX_ROOT = workDir;
+        delete process.env.OMX_STATE_ROOT;
+        delete process.env.OMX_TEAM_STATE_ROOT;
+        process.env.OMX_SESSION_ID = sessionId;
+        process.env.OMX_TMUX_HUD_OWNER = '1';
+        process.env.OMX_TMUX_HUD_LEADER_PANE = fixture.leaderPaneId;
+        process.env.OMX_ENTRY_PATH = omxEntry;
+        process.env.OMX_STARTUP_CWD = process.cwd();
+        delete process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE;
+        fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', sessionId]);
+        await waitForPaneReady(fixture, fixture.leaderPaneId);
+        assert.ok(
+          Number(fixture.run(['display-message', '-p', '-t', fixture.leaderPaneId, '#{window_height}']))
+            < HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES,
+        );
+
+        const prompt = {
+          hook_event_name: 'UserPromptSubmit',
+          cwd: workDir,
+          session_id: sessionId,
+          prompt: 'Inspect the HUD integration test',
+        };
+        await dispatchCodexNativeHook(prompt, { cwd: workDir });
+        assert.deepEqual(
+          findHudWatchPaneIds(listCurrentWindowPanes(undefined, fixture.leaderPaneId), fixture.leaderPaneId, {
+            leaderPaneId: fixture.leaderPaneId,
+            sessionId,
+          }),
+          [],
+        );
+        fixture.run(['resize-window', '-t', fixture.windowTarget, '-x', '120', '-y', '50']);
+        assert.equal(fixture.run(['display-message', '-p', '-t', fixture.leaderPaneId, '#{window_height}']), '50');
+
+        await dispatchCodexNativeHook(prompt, { cwd: workDir });
+        const firstPanes = listCurrentWindowPanes(undefined, fixture.leaderPaneId);
+        const firstHudIds = findHudWatchPaneIds(firstPanes, fixture.leaderPaneId, {
+          leaderPaneId: fixture.leaderPaneId,
+          sessionId,
+        });
+        assert.equal(firstHudIds.length, 1);
+        const hudPaneId = firstHudIds[0]!;
+        await waitForPaneReady(fixture, hudPaneId);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, hudPaneId, omxEntry);
+
+        await dispatchCodexNativeHook(prompt, { cwd: workDir });
+        const secondPanes = listCurrentWindowPanes(undefined, fixture.leaderPaneId);
+        assert.deepEqual(
+          findHudWatchPaneIds(secondPanes, fixture.leaderPaneId, {
+            leaderPaneId: fixture.leaderPaneId,
+            sessionId,
+          }),
+          [hudPaneId],
+        );
+        fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', `${sessionId}-successor`]);
+        await waitForPaneToDisappear(fixture, hudPaneId, 'owner identity change');
+        assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
+      });
+    } finally {
+      for (let index = 0; index < envKeys.length; index += 1) {
+        const key = envKeys[index]!;
+        const value = previousEnv[index];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await removeTempDirWithRetry(workDir);
+    }
+  });
+
   it('creates a marker-tagged HUD pane and round-trips the tmux 3.2a pane_start_command', async (t) => {
     if (!skipUnlessPrivateRealTmux(t)) return;
 
