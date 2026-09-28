@@ -128,6 +128,7 @@ async function createPluginMirrorFixtureRoot(): Promise<string> {
     cp(join(root, 'package.json'), join(fixtureRoot, 'package.json')),
     cp(join(root, 'plugins', pluginName), join(fixtureRoot, 'plugins', pluginName), { recursive: true }),
     cp(join(root, 'skills'), join(fixtureRoot, 'skills'), { recursive: true }),
+    cp(join(root, 'templates'), join(fixtureRoot, 'templates'), { recursive: true }),
     cp(join(root, 'src', 'catalog', 'manifest.json'), join(fixtureRoot, 'src', 'catalog', 'manifest.json')),
   ]);
   return fixtureRoot;

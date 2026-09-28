@@ -165,6 +165,7 @@ function assertPluginHookLauncherContractMarkerPresent(
 function getPluginPaths(root: string): {
 	pluginRoot: string;
 	pluginSkillsDir: string;
+	pluginTemplatesDir: string;
 	pluginMcpPath: string;
 	pluginAppsPath: string;
 	pluginManifestPath: string;
@@ -175,6 +176,7 @@ function getPluginPaths(root: string): {
 	return {
 		pluginRoot,
 		pluginSkillsDir: join(pluginRoot, "skills"),
+		pluginTemplatesDir: join(pluginRoot, "templates"),
 		pluginMcpPath: join(pluginRoot, ".mcp.json"),
 		pluginAppsPath: join(pluginRoot, ".app.json"),
 		pluginManifestPath: join(pluginRoot, ".codex-plugin", "plugin.json"),
@@ -406,7 +408,7 @@ export async function syncPluginMirror(
 	const manifest = readCatalogManifest(root);
 	const skillNames = [...getSetupInstallableSkillNames(manifest)].sort();
 	const rootSkillsDir = join(root, "skills");
-	const { pluginSkillsDir } = getPluginPaths(root);
+	const { pluginSkillsDir, pluginTemplatesDir } = getPluginPaths(root);
 
 	await assertRootSkillCatalogConsistency(root, skillNames);
 
@@ -432,6 +434,16 @@ export async function syncPluginMirror(
 				`mirrored skills/${skillName} -> plugins/${PLUGIN_NAME}/skills/${skillName}`,
 			);
 		}
+	}
+
+	// Sync templates directory to make plugin skill contract links resolve correctly
+	await rm(pluginTemplatesDir, { recursive: true, force: true });
+	await mkdir(pluginTemplatesDir, { recursive: true });
+	await cp(join(root, "templates", "AGENTS.md"), join(pluginTemplatesDir, "AGENTS.md"));
+	if (options.verbose) {
+		console.log(
+			`synced templates/AGENTS.md -> plugins/${PLUGIN_NAME}/templates/AGENTS.md`,
+		);
 	}
 
 	const metadataChanged = await writePluginMetadata(root, options.verbose);
