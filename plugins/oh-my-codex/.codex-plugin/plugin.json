@@ -18,6 +18,7 @@
     "multi-agent"
   ],
   "skills": "./skills/",
+  "templates": "./templates/",
   "mcpServers": "./.mcp.json",
   "apps": "./.app.json",
   "interface": {

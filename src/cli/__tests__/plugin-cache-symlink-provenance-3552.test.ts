@@ -817,6 +817,98 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
     });
   }
 
+  it("templates/AGENTS.md content drift is rejected before unchanged acceptance", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-3552-templates-drift-"));
+    try {
+      await withIsolatedUserHome(wd, async (codexHomeDir) => {
+        const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+        assert.ok(packaged);
+        const cacheDir = await seedRegularSnapshot(codexHomeDir);
+        const cachedPath = join(cacheDir, "templates", "AGENTS.md");
+        const sentinel = "# Attacker AGENTS.md\n";
+        await writeFile(cachedPath, sentinel);
+
+        assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), false);
+        const r = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+        assert.equal(r.status, "stale-launcher", JSON.stringify(r));
+        assert.match(r.reason!, /templates AGENTS\.md content differs/);
+        assert.equal(await readFile(cachedPath, "utf-8"), sentinel);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("templates/AGENTS.md symlink with canonical external content is rejected and preserved", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-3552-templates-symlink-"));
+    try {
+      await withIsolatedUserHome(wd, async (codexHomeDir) => {
+        const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+        assert.ok(packaged);
+        const cacheDir = await seedRegularSnapshot(codexHomeDir);
+        const cachedPath = join(cacheDir, "templates", "AGENTS.md");
+        const externalPath = join(wd, "external", "templates", "AGENTS.md");
+        await mkdir(dirname(externalPath), { recursive: true });
+        await rename(cachedPath, externalPath);
+        await symlink(externalPath, cachedPath);
+
+        assert.equal((await lstat(cachedPath)).isSymbolicLink(), true);
+        assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), false);
+        const r = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+        assert.equal(r.status, "stale-launcher", JSON.stringify(r));
+        assert.match(r.reason!, /templates AGENTS\.md .*symlink/);
+        assert.equal((await lstat(cachedPath)).isSymbolicLink(), true);
+        await writeFile(externalPath, "# Attacker AGENTS.md\n");
+        const r2 = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+        assert.equal(r2.status, "stale-launcher", JSON.stringify(r2));
+        assert.equal(await readFile(cachedPath, "utf-8"), "# Attacker AGENTS.md\n");
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("templates/AGENTS.md non-regular entry is rejected fail-closed", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-3552-templates-nonregular-"));
+    try {
+      await withIsolatedUserHome(wd, async (codexHomeDir) => {
+        const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+        assert.ok(packaged);
+        const cacheDir = await seedRegularSnapshot(codexHomeDir);
+        const cachedPath = join(cacheDir, "templates", "AGENTS.md");
+        await rm(cachedPath, { force: true });
+        await mkdir(cachedPath);
+
+        assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), false);
+        const r = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+        assert.equal(r.status, "stale-launcher", JSON.stringify(r));
+        assert.match(r.reason!, /templates AGENTS\.md .*not a regular file/);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("templates directory missing is rejected fail-closed", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-3552-templates-missing-dir-"));
+    try {
+      await withIsolatedUserHome(wd, async (codexHomeDir) => {
+        const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+        assert.ok(packaged);
+        const cacheDir = await seedRegularSnapshot(codexHomeDir);
+        const templatesDir = join(cacheDir, "templates");
+        await rm(templatesDir, { recursive: true, force: true });
+
+        assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), false);
+        const r = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+        assert.equal(r.status, "stale-launcher", JSON.stringify(r));
+        assert.match(r.reason!, /templates directory is missing/);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("rejects companion symlink swaps during descriptor-bound provenance validation", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-3552-companion-toctou-"));
     try {
@@ -1118,6 +1210,7 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
         const surfaces = [
           ".mcp.json",
           ".app.json",
+          "templates/AGENTS.md",
           ".codex-plugin/plugin.json",
           "skills/worker/SKILL.md",
           "hooks/hooks.json",

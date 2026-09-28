@@ -36,6 +36,7 @@ interface PluginManifest {
 	name?: unknown;
 	version?: unknown;
 	skills?: unknown;
+	templates?: unknown;
 	hooks?: unknown;
 	mcpServers?: unknown;
 	apps?: unknown;
@@ -1277,6 +1278,9 @@ async function omxPluginCacheManifestProvenanceReason(
 	if (manifest.apps !== "./.app.json") {
 		return `plugin manifest apps pointer is not ./.app.json at ${manifestPath}`;
 	}
+	if (manifest.templates !== "./templates/") {
+		return `plugin manifest templates pointer is not ./templates/ at ${manifestPath}`;
+	}
 	return null;
 }
 
@@ -1389,6 +1393,37 @@ async function omxPluginCacheCompanionMetadataProvenanceReason(
 	return null;
 }
 
+async function omxPluginCacheTemplatesProvenanceReason(
+	cacheDir: string,
+	packagedMarketplace: PackagedOmxMarketplace,
+): Promise<string | null> {
+	const templatesDir = join(cacheDir, "templates");
+	let templatesDirStats;
+	try {
+		templatesDirStats = await lstat(templatesDir);
+	} catch {
+		return `templates directory is missing at ${templatesDir}`;
+	}
+	if (!templatesDirStats.isDirectory() || templatesDirStats.isSymbolicLink()) {
+		return `templates directory at ${templatesDir} is a symlink or not a directory`;
+	}
+	const agentsFile = join(templatesDir, "AGENTS.md");
+	let agentsStats;
+	try {
+		agentsStats = await lstat(agentsFile);
+	} catch {
+		return `templates AGENTS.md is missing at ${agentsFile}`;
+	}
+	if (!agentsStats.isFile() || agentsStats.isSymbolicLink() || agentsStats.nlink !== 1) {
+		return `templates AGENTS.md at ${agentsFile} is a symlink or not a regular file`;
+	}
+	const packagedAgentsFile = join(packagedMarketplace.pluginRoot, "templates", "AGENTS.md");
+	if (!(await fileContentsEqual(agentsFile, packagedAgentsFile, cacheDir))) {
+		return `templates AGENTS.md content differs at ${agentsFile}`;
+	}
+	return null;
+}
+
 export async function omxPluginCacheProvenanceReason(
 	cacheDir: string,
 	packagedMarketplace: PackagedOmxMarketplace,
@@ -1399,6 +1434,8 @@ export async function omxPluginCacheProvenanceReason(
 	if (manifestReason) return manifestReason;
 	const companionReason = await omxPluginCacheCompanionMetadataProvenanceReason(cacheDir, packagedMarketplace);
 	if (companionReason) return companionReason;
+	const templatesReason = await omxPluginCacheTemplatesProvenanceReason(cacheDir, packagedMarketplace);
+	if (templatesReason) return templatesReason;
 	const expectedSkillNames = await expectedPackagedOmxSkillNames(packagedMarketplace, options);
 	if (!expectedSkillNames) return "packaged skill names are unavailable";
 	const skillsReason = await omxPluginCacheSkillsProvenanceReason(cacheDir, packagedMarketplace, expectedSkillNames);
