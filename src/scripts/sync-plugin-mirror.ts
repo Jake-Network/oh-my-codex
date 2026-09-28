@@ -218,6 +218,12 @@ async function comparePluginTemplate(
 		return "invalid: AGENTS.md is a symlink or not a regular file";
 	}
 
+	// Verify that templates directory contains exactly ['AGENTS.md']
+	const templateFiles = (await readdir(pluginTemplatesDir)).sort();
+	if (templateFiles.length !== 1 || templateFiles[0] !== "AGENTS.md") {
+		return "invalid: templates directory must contain exactly 'AGENTS.md'";
+	}
+
 	const sourceContent = await readFile(sourceTemplatePath, "utf-8");
 	const pluginContent = await readFile(pluginTemplatePath, "utf-8");
 

@@ -1642,4 +1642,34 @@ process.stdin.on('end', () => {
       await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
+
+  it('fails sync:plugin:check when extra files exist in templates directory', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesDir = join(fixtureRoot, 'plugins', pluginName, 'templates');
+      // Create an extra file in the templates directory
+      await writeFile(join(pluginTemplatesDir, 'extra-file.txt'), 'stray file');
+      // Should fail in check mode
+      let failed = false;
+      try {
+        const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+        await syncPluginMirror({ root: fixtureRoot, check: true });
+      } catch (e) {
+        failed = true;
+        const error = e instanceof Error ? e.message : String(e);
+        assert.match(error, /plugin_template_out_of_sync/);
+        assert.match(error, /templates directory must contain exactly/);
+      }
+      assert.equal(failed, true, 'expected check mode to fail when extra files exist in templates/');
+      // Sync mode should remove the extra file and report changed=true
+      const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+      const result = await syncPluginMirror({ root: fixtureRoot, verbose: false });
+      assert.equal(result.changed, true, 'expected changed=true when extra files were removed');
+      // Verify the extra file is gone
+      const files = await readdir(pluginTemplatesDir);
+      assert.deepEqual(files.sort(), ['AGENTS.md'], 'expected only AGENTS.md to remain');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
 });
