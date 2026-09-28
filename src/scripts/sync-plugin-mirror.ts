@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -165,6 +165,7 @@ function assertPluginHookLauncherContractMarkerPresent(
 function getPluginPaths(root: string): {
 	pluginRoot: string;
 	pluginSkillsDir: string;
+	pluginTemplatesDir: string;
 	pluginMcpPath: string;
 	pluginAppsPath: string;
 	pluginManifestPath: string;
@@ -175,12 +176,62 @@ function getPluginPaths(root: string): {
 	return {
 		pluginRoot,
 		pluginSkillsDir: join(pluginRoot, "skills"),
+		pluginTemplatesDir: join(pluginRoot, "templates"),
 		pluginMcpPath: join(pluginRoot, ".mcp.json"),
 		pluginAppsPath: join(pluginRoot, ".app.json"),
 		pluginManifestPath: join(pluginRoot, ".codex-plugin", "plugin.json"),
 		pluginHooksPath: join(pluginRoot, "hooks", "hooks.json"),
 		pluginHookLauncherPath: join(pluginRoot, "hooks", "codex-native-hook.mjs"),
 	};
+}
+
+/**
+ * Compare the source and plugin template files
+ * Returns null if they match, otherwise returns a description of the difference
+ */
+async function comparePluginTemplate(
+	root: string,
+	pluginTemplatesDir: string,
+): Promise<string | null> {
+	const sourceTemplatePath = join(root, "templates", "AGENTS.md");
+	const pluginTemplatePath = join(pluginTemplatesDir, "AGENTS.md");
+
+	// Verify that pluginTemplatesDir is a real directory (not a symlink)
+	let pluginTemplatesDirStats;
+	try {
+		pluginTemplatesDirStats = await lstat(pluginTemplatesDir);
+	} catch {
+		return "missing";
+	}
+	if (!pluginTemplatesDirStats.isDirectory() || pluginTemplatesDirStats.isSymbolicLink()) {
+		return "invalid: templates directory is a symlink or not a directory";
+	}
+
+	// Verify that AGENTS.md is a real file (not a symlink, with single link)
+	let pluginAgentsStats;
+	try {
+		pluginAgentsStats = await lstat(pluginTemplatePath);
+	} catch {
+		return "missing";
+	}
+	if (!pluginAgentsStats.isFile() || pluginAgentsStats.isSymbolicLink() || pluginAgentsStats.nlink !== 1) {
+		return "invalid: AGENTS.md is a symlink or not a regular file";
+	}
+
+	// Verify that templates directory contains exactly ['AGENTS.md']
+	const templateFiles = (await readdir(pluginTemplatesDir)).sort();
+	if (templateFiles.length !== 1 || templateFiles[0] !== "AGENTS.md") {
+		return "invalid: templates directory must contain exactly 'AGENTS.md'";
+	}
+
+	const sourceContent = await readFile(sourceTemplatePath, "utf-8");
+	const pluginContent = await readFile(pluginTemplatePath, "utf-8");
+
+	if (sourceContent !== pluginContent) {
+		return "stale";
+	}
+
+	return null;
 }
 
 async function assertRootSkillCatalogConsistency(
@@ -406,13 +457,25 @@ export async function syncPluginMirror(
 	const manifest = readCatalogManifest(root);
 	const skillNames = [...getSetupInstallableSkillNames(manifest)].sort();
 	const rootSkillsDir = join(root, "skills");
-	const { pluginSkillsDir } = getPluginPaths(root);
+	const { pluginSkillsDir, pluginTemplatesDir } = getPluginPaths(root);
 
 	await assertRootSkillCatalogConsistency(root, skillNames);
 
 	if (options.check) {
 		await assertSkillMirror(rootSkillsDir, pluginSkillsDir, skillNames);
 		await assertPluginMetadata(root);
+		// Verify the plugin template matches the source template
+		const templateMismatch = await comparePluginTemplate(root, pluginTemplatesDir);
+		if (templateMismatch !== null) {
+			throw new Error(
+				[
+					"plugin_template_out_of_sync",
+					`reason=${templateMismatch}`,
+					`expected=templates/AGENTS.md`,
+					`actual=plugins/${PLUGIN_NAME}/templates/AGENTS.md`,
+				].join("\n"),
+			);
+		}
 		return { checked: true, mirroredSkillNames: skillNames, changed: false };
 	}
 
@@ -434,6 +497,17 @@ export async function syncPluginMirror(
 		}
 	}
 
+	// Sync templates directory to make plugin skill contract links resolve correctly
+	const beforeTemplateMatch = (await comparePluginTemplate(root, pluginTemplatesDir)) === null;
+	await rm(pluginTemplatesDir, { recursive: true, force: true });
+	await mkdir(pluginTemplatesDir, { recursive: true });
+	await cp(join(root, "templates", "AGENTS.md"), join(pluginTemplatesDir, "AGENTS.md"));
+	if (options.verbose) {
+		console.log(
+			`synced templates/AGENTS.md -> plugins/${PLUGIN_NAME}/templates/AGENTS.md`,
+		);
+	}
+
 	const metadataChanged = await writePluginMetadata(root, options.verbose);
 
 	await assertSkillMirror(rootSkillsDir, pluginSkillsDir, skillNames);
@@ -441,7 +515,7 @@ export async function syncPluginMirror(
 	return {
 		checked: false,
 		mirroredSkillNames: skillNames,
-		changed: !beforeSkillsMatch || metadataChanged,
+		changed: !beforeSkillsMatch || metadataChanged || !beforeTemplateMatch,
 	};
 }
 
