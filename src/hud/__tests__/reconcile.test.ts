@@ -5,12 +5,42 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { dirname } from 'node:path';
 import { join } from 'node:path';
-import { OMX_TMUX_HUD_OWNER_ENV, reconcileHudForPromptSubmit } from '../reconcile.js';
+import { OMX_TMUX_HUD_OWNER_ENV, assessOwnedHudLayout, reconcileHudForPromptSubmit } from '../reconcile.js';
 import { HUD_TMUX_HEIGHT_LINES, HUD_TMUX_ULTRAGOAL_HEIGHT_LINES, HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES } from '../constants.js';
 import { OMX_TMUX_HUD_LEADER_PANE_ENV } from '../tmux.js';
 
 const noOpRegisterHudResizeHook = () => true;
 const noOpUnregisterHudResizeHook = () => true;
+
+describe('assessOwnedHudLayout', () => {
+  const leader = { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', panePid: '101',
+    paneLeft: 0, paneTop: 0, paneWidth: 80, paneHeight: 20, paneBottom: 19, windowWidth: 80, windowHeight: 23 };
+  const hud = { paneId: '%2', currentCommand: 'node', panePid: '102',
+    startCommand: "OMX_TMUX_HUD_OWNER='1' OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' node omx hud --watch",
+    paneLeft: 0, paneTop: 21, paneWidth: 80, paneHeight: 2, paneBottom: 22, windowWidth: 80, windowHeight: 23 };
+
+  it('recognizes a complete owned layout without requesting repair', () => {
+    assert.deepEqual(assessOwnedHudLayout([leader, hud], '%1', '%2', 'sess-a', 2),
+      { status: 'healthy', reason: 'verified' });
+  });
+
+  it('requires repair for a duplicate owned HUD', () => {
+    assert.deepEqual(assessOwnedHudLayout([leader, hud, { ...hud, paneId: '%3' }], '%1', '%2', 'sess-a', 2),
+      { status: 'repair_needed', reason: 'duplicate_hud' });
+  });
+
+  it('does not treat incomplete geometry as healthy', () => {
+    assert.deepEqual(assessOwnedHudLayout([leader, { ...hud, paneTop: undefined }], '%1', '%2', 'sess-a', 2),
+      { status: 'unknown', reason: 'incomplete_geometry' });
+  });
+
+  it('requires repair when a same-session HUD references a missing leader', () => {
+    const orphan = { ...hud, paneId: '%3',
+      startCommand: "OMX_TMUX_HUD_OWNER='1' OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%9' node omx hud --watch" };
+    assert.deepEqual(assessOwnedHudLayout([leader, hud, orphan], '%1', '%2', 'sess-a', 2),
+      { status: 'repair_needed', reason: 'orphaned_hud' });
+  });
+});
 
 async function writeHudReconcileLock(
   cwd: string,
@@ -100,6 +130,28 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.equal(created, false);
     assert.equal(resized, false);
     assert.equal(killed, false);
+  });
+
+  it('fences a watcher repair child when the leader owner changed', async () => {
+    let mutations = 0;
+    const result = await reconcileHudForPromptSubmit('/repo', {
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-a',
+        OMX_HUD_WATCH_REPAIR: '1', OMX_HUD_WATCH_LEADER_PID: '101', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      listCurrentWindowPanes: () => [
+        { paneId: '%1', panePid: '101', currentCommand: 'codex', startCommand: 'codex' },
+        { paneId: '%2', panePid: '102', currentCommand: 'node',
+          startCommand: `env OMX_SESSION_ID='old-session' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch` },
+      ],
+      readHudLeaderOwnerIdentity: () => 'mismatch',
+      killTmuxPane: () => { mutations += 1; return true; },
+      resizeTmuxPane: () => { mutations += 1; return true; },
+      createHudWatchPane: () => { mutations += 1; return '%3'; },
+      unregisterHudResizeHook: () => { mutations += 1; return true; },
+      registerHudResizeHook: () => { mutations += 1; return true; },
+      resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+    });
+    assert.equal(result.status, 'skipped_stale_leader_pane');
+    assert.equal(mutations, 0);
   });
 
   it('skips an unusable empty pane snapshot without mutating tmux layout', async () => {
@@ -256,8 +308,9 @@ describe('reconcileHudForPromptSubmit', () => {
         assert.deepEqual(created, []);
       } else {
         assert.equal(result.paneId, '%4');
-        assert.deepEqual(created, [expectedHeight]);
+        assert.deepEqual(created, [5]);
         assert.deepEqual(killed, scenario === 'single-invalid' ? ['%2'] : ['%2', '%3']);
+        assert.deepEqual(resized, [{ paneId: '%4', height: expectedHeight }]);
       }
     });
   }
@@ -2282,7 +2335,7 @@ printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
-  printf '160\t${crampedHeight}\n'
+  printf '160|${crampedHeight}\n'
 fi
 if [[ "$cmd" == "list-panes" && "\${!#}" == '#{pane_id}' ]]; then
   printf '%%1\n'
@@ -2316,8 +2369,8 @@ fi
       assert.deepEqual(created, []);
       const log = await readFile(tmuxLogPath, 'utf-8');
       assert.match(log, /\[list-panes\]\[-t\]\[%1\]\[-F\]\[#\{pane_id\}\]/);
-      assert.match(log, /\[list-panes\]\[-t\]\[%1\]\[-F\]\[#\{pane_id\}\x1f#\{pane_current_command\}\x1f#\{pane_left\}\x1f#\{pane_top\}\x1f#\{pane_width\}\x1f#\{pane_height\}\x1f#\{pane_bottom\}\x1f#\{window_width\}\x1f#\{window_height\}\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}\x1f#\{pane_dead\}\x1f#\{pane_pid\}\]/);
-      assert.match(log, /\[display-message\]\[-p\]\[-t\]\[%1\]\[#\{window_width\}\t#\{window_height\}\]/);
+      assert.match(log, /\[list-panes\]\[-t\]\[%1\]\[-F\]\[#\{pane_id\}\x1f#\{pane_current_command\}\x1f#\{pane_left\}\x1f#\{pane_top\}\x1f#\{pane_width\}\x1f#\{pane_height\}\x1f#\{pane_bottom\}\x1f#\{window_width\}\x1f#\{window_height\}\x1f#\{session_id\}\x1f#\{window_id\}\x1f#\{pane_dead\}\x1f#\{pane_pid\}\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}\]/);
+      assert.match(log, /\[display-message\]\[-p\]\[-t\]\[%1\]\[#\{window_width\}\|#\{window_height\}\]/);
     } finally {
       process.env.PATH = originalPath;
       await rm(cwd, { recursive: true, force: true });

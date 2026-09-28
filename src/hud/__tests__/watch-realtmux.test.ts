@@ -80,6 +80,7 @@ await runWatchMode(${JSON.stringify(dir)}, { watch: true, json: false, tmux: fal
 		const dir = await mkdtemp(join(tmpdir(), "omx-hud-reconcile ' "));
 		try {
 			await withTempTmuxSession({}, async fixture => {
+				fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', 'quiet-repair-test']);
 				const commandLog = join(dir, 'tmux-commands');
 				await fixture.createPathShim(dir, commandLog);
 				const entry = join(dir, 'omx.js');
@@ -97,12 +98,12 @@ await runWatchMode(${JSON.stringify(dir)}, { watch:true, json:false, tmux:false 
   isTTY:true, isOwnerAliveFn: async () => true, isSessionAttachedFn: () => true,
   readHudConfigFn:async () => ({preset:'focused'}), readAllStateFn:async () => ({}),
   renderHudFn:() => 'QUIET_HUD', runAuthorityTickFn:async () => {},
-  listCurrentWindowPanesFn:() => [], resizeTmuxPaneFn:() => true,
+  resizeTmuxPaneFn:() => true,
   clearTmuxPaneHistoryFn:() => true, registerHudResizeHookFn:() => true,
 });
 `);
 				const hud = fixture.run(['split-window', '-d', '-c', dir, '-P', '-F', '#{pane_id}', '-t', fixture.leaderPaneId,
-					`exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)} ${quoteSh(process.execPath)} ${quoteSh(runner)}`]);
+					`exec env OMX_SESSION_ID=quiet-repair-test OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)} ${quoteSh(process.execPath)} ${quoteSh(runner)} hud --watch`]);
 				await waitForFile(marker);
 				await new Promise(resolve => setTimeout(resolve, 1500));
 				assert.deepEqual(JSON.parse(await readFile(marker, 'utf8')), { args: ['hud', '--reconcile-tmux'], pane: fixture.leaderPaneId, root: dir });
@@ -260,6 +261,7 @@ await runWatchMode(process.cwd(), { watch: true, json: false, tmux: false, prese
     process.stdout.write(text);
   },
   registerHudResizeHookFn: () => true,
+  readHudHookHealthFn: () => 'healthy',
 });
 `;
 }
@@ -285,7 +287,8 @@ describe("HUD watch real PTY/tmux publication", () => {
 			await chmod(runnerPath, 0o755);
 
 			await withTempTmuxSession(async (fixture) => {
-				const hudCommand = `exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)} node ${quoteSh(runnerPath)}`;
+				fixture.run(['set-option', '-t', fixture.sessionName, '@omx_instance_id', 'refresh-test']);
+				const hudCommand = `exec env OMX_SESSION_ID=refresh-test OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)} node ${quoteSh(runnerPath)} hud --watch`;
 				const hudPaneId = fixture.run([
 					"split-window",
 					"-v",

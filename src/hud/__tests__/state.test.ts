@@ -12,6 +12,7 @@ import {
   buildGitBranchLabel,
   readGitBranch,
   readAllState,
+  readHudLayoutProjection,
   readTeamState,
   readHudNotifyState,
   readRalphState,
@@ -1898,6 +1899,126 @@ describe('readAllState canonical skill precedence', () => {
       } finally {
         if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
       }
+    });
+  });
+});
+
+describe('readHudLayoutProjection', () => {
+  it('matches render-state precedence for Ultragoal artifacts and canonical Team membership', async () => {
+    await withTempRepo('omx-hud-layout-projection-', async (cwd) => {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-layout-projection';
+      const sessionDir = join(stateRoot, 'sessions', sessionId);
+      const teamDir = join(stateRoot, 'team', 'alpha');
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(teamDir, { recursive: true });
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateRoot }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'team',
+        phase: 'team-exec',
+        session_id: sessionId,
+        active_skills: [{ skill: 'team', phase: 'team-exec', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'ultragoal-state.json'), JSON.stringify({ active: false }));
+      await writeFile(join(sessionDir, 'team-state.json'), JSON.stringify({ active: true, team_name: 'alpha' }));
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        activeGoalId: 'G001',
+        goals: [{ id: 'G001', title: 'Keep HUD visible', objective: 'exercise artifact precedence', status: 'in_progress' }],
+      }));
+      await writeFile(join(teamDir, 'config.json'), JSON.stringify({
+        name: 'alpha',
+        workers: [{ name: 'legacy-worker' }],
+      }));
+      await writeFile(join(teamDir, 'manifest.v2.json'), JSON.stringify({
+        name: 'alpha',
+        workers: [
+          { name: 'worker-1' },
+          { name: 'worker-2' },
+          { name: 'worker-1' },
+          { name: '../../outside' },
+          null,
+        ],
+      }));
+
+      const projection = await readHudLayoutProjection(cwd);
+      const state = await readAllState(cwd);
+
+      assert.deepEqual(projection, { ultragoalActive: true, teamWorkerCount: 2 });
+      assert.equal(projection.ultragoalActive, state.ultragoal?.active === true);
+      assert.equal(projection.teamWorkerCount, state.team?.workers?.length ?? 0);
+    });
+  });
+
+  it('falls through a malformed Ultragoal artifact to active canonical session state', async () => {
+    await withTempRepo('omx-hud-layout-projection-malformed-', async (cwd) => {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-layout-malformed';
+      const sessionDir = join(stateRoot, 'sessions', sessionId);
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateRoot }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'ultragoal',
+        phase: 'executing',
+        session_id: sessionId,
+        active_skills: [{ skill: 'ultragoal', phase: 'executing', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'ultragoal-state.json'), JSON.stringify({ active: true }));
+      await writeFile(join(ultragoalDir, 'goals.json'), '{malformed');
+
+      assert.deepEqual(await readHudLayoutProjection(cwd), {
+        ultragoalActive: true,
+        teamWorkerCount: 0,
+      });
+    });
+  });
+
+  it('suppresses inactive canonical state and uses legacy Team config when the manifest is malformed', async () => {
+    await withTempRepo('omx-hud-layout-projection-inactive-', async (cwd) => {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-layout-inactive';
+      const sessionDir = join(stateRoot, 'sessions', sessionId);
+      const teamDir = join(stateRoot, 'team', 'alpha');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(teamDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateRoot }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'team',
+        phase: 'team-exec',
+        session_id: sessionId,
+        active_skills: [{ skill: 'team', phase: 'team-exec', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'ultragoal-state.json'), JSON.stringify({ active: true }));
+      await writeFile(join(sessionDir, 'team-state.json'), JSON.stringify({ active: true, team_name: 'alpha' }));
+      await writeFile(join(teamDir, 'manifest.v2.json'), '{malformed');
+      await writeFile(join(teamDir, 'config.json'), JSON.stringify({
+        name: 'alpha',
+        workers: [{ name: 'worker-1' }, { name: 'worker-2' }],
+      }));
+
+      assert.deepEqual(await readHudLayoutProjection(cwd), {
+        ultragoalActive: false,
+        teamWorkerCount: 2,
+      });
+
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: false,
+        skill: 'team',
+        phase: 'complete',
+        session_id: sessionId,
+        active_skills: [],
+      }));
+
+      assert.deepEqual(await readHudLayoutProjection(cwd), {
+        ultragoalActive: false,
+        teamWorkerCount: 0,
+      });
     });
   });
 });
