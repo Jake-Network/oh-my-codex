@@ -10886,30 +10886,27 @@ case "$1" in
       printf '%%1 0 200\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9 0 201\n'
     elif [[ "$*" == *'pane_current_command'* ]]; then
-      printf '%%1\t/bin/codex\t0\t0\t80\t58\t57\t80\t61\t/bin/codex\t/tmp\t0\t200\n'
-      if [[ "$*" != *'-t %1'* && "$panes" == *'%9'* ]]; then
-        printf '%%9\tnode\t0\t59\t80\t2\t60\t80\t61\tenv OMX_SESSION_ID=sess-hud-1 OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\t/tmp\t0\t201\n'
-      fi
+      printf '%%1\x1f/bin/codex\x1f0\x1f0\x1f80\x1f58\x1f57\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f200\x1f/bin/codex\x1f/tmp\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9\x1fnode\x1f0\x1f59\x1f80\x1f2\x1f60\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f201\x1fenv OMX_SESSION_ID=sess-hud-1 OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\x1f/tmp\n'
+    elif [[ "$*" == *'#{pane_id}|#{pane_start_command}'* ]]; then
+      printf '%%1|/bin/codex\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9|OMX_TMUX_SPLIT_OPERATION_MARKER=%s; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n' "'$marker'"
     elif [[ "$*" == *'pane_start_command'* ]]; then
       printf '%%1\t/bin/codex\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
     elif [[ "$panes" == *'%9'* ]]; then
-      if [[ "$*" == *'-t %1'* ]]; then
-        printf '%%1\n'
-      else
-        printf '%%1\n%%9\n'
-      fi
+      printf '%%1\n%%9\n'
     else
       printf '%%1\n'
     fi
     ;;
   display-message)
     if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
-      printf '%%1\t0\t200\t$1\t@1\n'
+      printf '%%1|0|200|$1|@1\n'
     elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
-      printf '$1\t@1\n'
+      printf '$1|@1\n'
     else
-      printf '200\t60\n'
+      printf '200|60\n'
     fi
     ;;
   set-option)
@@ -10942,6 +10939,7 @@ printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
   resize-pane)
     ;;
 esac
+exit 0
 `
 			);
 			await chmod(join(binDir, "tmux"), 0o755);
@@ -11087,18 +11085,22 @@ case "$1" in
       printf '%%1 0 200\n%%2 0 201\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9 0 202\n'
     elif [[ "$*" == *'pane_current_command'* ]]; then
-      printf '%%1\t/bin/codex\t0\t0\t80\t58\t57\t80\t61\t/bin/codex\t/tmp\t0\t200\n'
+      printf '%%1\x1f/bin/codex\x1f0\x1f0\x1f80\x1f58\x1f57\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f200\x1f/bin/codex\x1f/tmp\n'
       if [[ "$*" != *'-t %1'* ]]; then
-        printf '%%2\tnode\t0\t59\t80\t2\t60\t80\t61\tenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\t/tmp\t0\t201\n'
-        [[ "$panes" == *'%9'* ]] && printf '%%9\tnode\t0\t59\t80\t2\t60\t80\t61\tenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\t/tmp\t0\t202\n'
+        printf '%%2\x1fnode\x1f0\x1f59\x1f80\x1f2\x1f60\x1f80\x1f61\x1f$1\x1f@2\x1f0\x1f201\x1fenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\x1f/tmp\n'
       fi
+      [[ "$panes" == *'%9'* ]] && printf '%%9\x1fnode\x1f0\x1f59\x1f80\x1f2\x1f60\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f202\x1fenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\x1f/tmp\n'
+    elif [[ "$*" == *'#{pane_id}|#{pane_start_command}'* ]]; then
+      printf '%%1|/bin/codex\n'
+      printf '%%2|exec env OMX_TMUX_HUD_OWNER=1 ${OMX_TMUX_HUD_LEADER_PANE_ENV}=%%1 /node /omx.js hud --watch\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9|OMX_TMUX_SPLIT_OPERATION_MARKER=%s; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n' "'$marker'"
     elif [[ "$*" == *'pane_start_command'* ]]; then
       printf '%%1\t/bin/codex\n'
       printf '%%2\texec env OMX_TMUX_HUD_OWNER='"'"'"1'"'"' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='"'"'"%%1'"'"' /node /omx.js hud --watch\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
     elif [[ "$panes" == *'%9'* ]]; then
       if [[ "$*" == *'-t %1'* ]]; then
-        printf '%%1\n'
+        printf '%%1\n%%9\n'
       else
         printf '%%1\n%%2\n%%9\n'
       fi
@@ -11112,11 +11114,11 @@ case "$1" in
     ;;
   display-message)
     if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
-      printf '%%1\t0\t200\t$1\t@1\n'
+      printf '%%1|0|200|$1|@1\n'
     elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
-      printf '$1\t@1\n'
+      printf '$1|@1\n'
     else
-      printf '200\t60\n'
+      printf '200|60\n'
     fi
     ;;
   set-option)
@@ -11149,6 +11151,7 @@ printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
   resize-pane)
     ;;
 esac
+exit 0
 `
 			);
 			await chmod(join(binDir, "tmux"), 0o755);
