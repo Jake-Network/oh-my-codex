@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -196,8 +196,26 @@ async function comparePluginTemplate(
 	const sourceTemplatePath = join(root, "templates", "AGENTS.md");
 	const pluginTemplatePath = join(pluginTemplatesDir, "AGENTS.md");
 
-	if (!existsSync(pluginTemplatePath)) {
+	// Verify that pluginTemplatesDir is a real directory (not a symlink)
+	let pluginTemplatesDirStats;
+	try {
+		pluginTemplatesDirStats = await lstat(pluginTemplatesDir);
+	} catch {
 		return "missing";
+	}
+	if (!pluginTemplatesDirStats.isDirectory() || pluginTemplatesDirStats.isSymbolicLink()) {
+		return "invalid: templates directory is a symlink or not a directory";
+	}
+
+	// Verify that AGENTS.md is a real file (not a symlink, with single link)
+	let pluginAgentsStats;
+	try {
+		pluginAgentsStats = await lstat(pluginTemplatePath);
+	} catch {
+		return "missing";
+	}
+	if (!pluginAgentsStats.isFile() || pluginAgentsStats.isSymbolicLink() || pluginAgentsStats.nlink !== 1) {
+		return "invalid: AGENTS.md is a symlink or not a regular file";
 	}
 
 	const sourceContent = await readFile(sourceTemplatePath, "utf-8");

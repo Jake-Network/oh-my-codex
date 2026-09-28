@@ -909,6 +909,31 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
     }
   });
 
+  it("templates directory as symlink is rejected fail-closed", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-3552-templates-dir-symlink-"));
+    try {
+      await withIsolatedUserHome(wd, async (codexHomeDir) => {
+        const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+        assert.ok(packaged);
+        const cacheDir = await seedRegularSnapshot(codexHomeDir);
+        const templatesDir = join(cacheDir, "templates");
+        const externalDir = join(wd, "external-templates");
+        await mkdir(externalDir, { recursive: true });
+        await cp(join(templatesDir, "AGENTS.md"), join(externalDir, "AGENTS.md"));
+        await rm(templatesDir, { recursive: true, force: true });
+        await symlink(externalDir, templatesDir);
+
+        assert.equal((await lstat(templatesDir)).isSymbolicLink(), true);
+        assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), false);
+        const r = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+        assert.equal(r.status, "stale-launcher", JSON.stringify(r));
+        assert.match(r.reason!, /templates directory .*symlink/);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("rejects companion symlink swaps during descriptor-bound provenance validation", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-3552-companion-toctou-"));
     try {
