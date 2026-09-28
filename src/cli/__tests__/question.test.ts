@@ -734,6 +734,64 @@ exit 0
     assert.doesNotMatch(tmuxLog, /new-session/);
   });
 
+  it('reports tmux access denial instead of misclassifying the session as detached', async () => {
+    const cwd = await makeRepo();
+    const fakeBinDir = join(cwd, 'fake-bin');
+    await mkdir(fakeBinDir, { recursive: true });
+    await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
+if [ "$1" = "display-message" ]; then
+  printf '%s\n' 'error connecting to /private/tmp/tmux-501/default (Operation not permitted)' >&2
+  exit 1
+fi
+exit 0
+`, { mode: 0o755 });
+
+    const input = JSON.stringify({
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }],
+      allow_other: true,
+      session_id: 'sess-q',
+    });
+
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
+        cwd,
+        env: makeQuestionCliEnv(cwd, {
+          PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
+          TMUX: '/private/tmp/tmux-501/default,3190,44',
+          TMUX_PANE: '%162',
+          OMX_QUESTION_RETURN_PANE: '',
+          OMX_LEADER_PANE_ID: '',
+          OMX_AUTO_UPDATE: '0',
+          OMX_NOTIFY_FALLBACK: '0',
+          OMX_HOOK_DERIVED_SIGNALS: '0',
+        }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+      child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+
+    assert.equal(result.code, 1);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, 'question_tmux_access_denied');
+    assert.match(payload.error.message, /tmux access was denied/i);
+    assert.match(payload.error.message, /Operation not permitted/i);
+    assert.doesNotMatch(payload.error.message, /no attached client/i);
+
+    const entries = await readdir(join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions'));
+    assert.equal(entries.length, 1);
+    const recordPath = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions', entries[0]!);
+    const record = JSON.parse(await readFile(recordPath, 'utf-8')) as { status: string; error?: { code?: string; message?: string } };
+    assert.equal(record.status, 'error');
+    assert.equal(record.error?.code, 'question_tmux_access_denied');
+    assert.doesNotMatch(record.error?.message || '', /no attached client/i);
+  });
+
   it('uses an explicit return pane to launch from a container-like shell without TMUX', async () => {
     const cwd = await makeRepo();
     const fakeBinDir = join(cwd, 'fake-bin');

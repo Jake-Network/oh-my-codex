@@ -32,6 +32,20 @@ export type ExecTmuxSync = (args: string[]) => string;
 export type SleepSync = (ms: number) => void;
 export type SpawnDetachedRenderer = (command: string, args: string[], options: SpawnOptions) => Pick<ChildProcess, 'pid' | 'unref'>;
 
+export type QuestionRendererLaunchErrorCode =
+  | 'question_tmux_access_denied'
+  | 'question_tmux_probe_failed';
+
+export class QuestionRendererLaunchError extends Error {
+  readonly code: QuestionRendererLaunchErrorCode;
+
+  constructor(code: QuestionRendererLaunchErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'QuestionRendererLaunchError';
+    this.code = code;
+  }
+}
+
 const QUESTION_TEXT_SETTLE_MS = 120;
 const QUESTION_SUBMIT_REPEAT_DELAY_MS = 100;
 const QUESTION_RENDERER_PANE_SETTLE_MS = 120;
@@ -39,6 +53,23 @@ const QUESTION_RENDERER_SESSION_SETTLE_MS = 120;
 
 function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+function describeTmuxProbeError(error: unknown): string {
+  if (!(error && typeof error === 'object')) return safeString(error) || 'unknown error';
+  const candidate = error as NodeJS.ErrnoException & { stderr?: unknown };
+  const code = safeString(candidate.code).trim();
+  const message = error instanceof Error ? error.message.trim() : '';
+  const stderr = Buffer.isBuffer(candidate.stderr)
+    ? candidate.stderr.toString('utf8').trim()
+    : safeString(candidate.stderr).trim();
+  return [...new Set([code, message, stderr].filter(Boolean))].join(': ') || 'unknown error';
+}
+
+function isTmuxAccessDeniedError(error: unknown): boolean {
+  return /\b(?:EPERM|EACCES)\b|operation not permitted|permission denied/i.test(
+    describeTmuxProbeError(error),
+  );
 }
 
 function isPaneId(value: string | null | undefined): value is string {
@@ -583,8 +614,20 @@ function isCurrentTmuxSessionAttached(
   try {
     const attached = execTmux(['display-message', '-p', ...targetArgs, '#{session_attached}']).trim();
     return Number.parseInt(attached, 10) > 0;
-  } catch {
-    return false;
+  } catch (error) {
+    const detail = describeTmuxProbeError(error);
+    if (isTmuxAccessDeniedError(error)) {
+      throw new QuestionRendererLaunchError(
+        'question_tmux_access_denied',
+        `omx question cannot determine whether the tmux session is attached because tmux access was denied during the attachment probe. The current sandbox or OS policy may not allow access to the tmux socket. ${detail}`,
+        { cause: error },
+      );
+    }
+    throw new QuestionRendererLaunchError(
+      'question_tmux_probe_failed',
+      `omx question cannot determine whether the tmux session is attached because the tmux attachment probe failed. ${detail}`,
+      { cause: error },
+    );
   }
 }
 
