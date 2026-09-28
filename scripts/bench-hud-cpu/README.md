@@ -10,7 +10,8 @@ Prepare two repository directories. The baseline directory must contain the affe
 scripts/bench-hud-cpu/compare.sh \
   --baseline-repo /absolute/path/to/baseline \
   --fixed-repo /absolute/path/to/fixed \
-  --results-dir "$PWD/hud-cpu-results"
+  --results-dir "$PWD/hud-cpu-results" \
+  --skip-real-tmux-tests
 ```
 
 The default matrix uses 1 and 6 owned HUD sessions, a 10-second warmup, three 30-second CPU samples, and a separate 15-second diagnostic sample. Every label, mode, and session count runs in an independent container with a 600-second external watchdog, two CPUs, and a 512-process ceiling. Add `--cases 1,6,19` only for a separately monitored saturation test. A failed 19-session container cannot prevent the lower-count cases from running. Each repository is mounted read-only and copied inside its container before `npm ci` and `npm run build`, so the measured source tree is not changed.
@@ -41,7 +42,7 @@ scripts/bench-hud-cpu/compare.sh \
 
 The diagnostic instrumentation is not enabled during CPU measurement. Setup and verification use `/usr/bin/tmux` directly, so their commands do not enter the diagnostic counts.
 
-The comparison also runs `dist/hud/__tests__/tmux-split-realtmux.test.js` with `CI=1` for each source tree. TAP output is printed to stderr and a JSON pass/fail record is stored in `{baseline,fixed}-real-tmux-tests.jsonl`. A failing real-tmux test makes the comparison command fail.
+Omit `--skip-real-tmux-tests` to run `dist/hud/__tests__/tmux-split-realtmux.test.js` with `CI=1` for each source tree. TAP output is printed to stderr and a JSON pass/fail record is stored in `{baseline,fixed}-real-tmux-tests.jsonl`. A failing real-tmux test makes the comparison command fail.
 
 ## Acceptance evidence
 
