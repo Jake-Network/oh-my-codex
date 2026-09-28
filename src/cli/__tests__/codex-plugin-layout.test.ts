@@ -417,6 +417,7 @@ describe('official Codex plugin layout', () => {
   it('defines a plugin manifest under a plugin root and keeps .codex-plugin limited to plugin.json', async () => {
     const pkg = await readJson<PackageJson>(join(root, 'package.json'));
     const manifest = await readJson<PluginManifest>(pluginManifestPath);
+    const manifestRaw = await readJson<Record<string, unknown>>(pluginManifestPath);
     const codexPluginEntries = await readdir(join(pluginRoot, '.codex-plugin'));
 
     assert.deepEqual(codexPluginEntries.sort(), ['plugin.json']);
@@ -426,6 +427,7 @@ describe('official Codex plugin layout', () => {
     assert.equal(manifest.skills, './skills/');
     assert.equal(manifest.mcpServers, './.mcp.json');
     assert.equal(manifest.apps, './.app.json');
+    assert.equal(manifestRaw.templates, undefined, 'plugin manifest should not include templates key');
     assert.equal(manifest.interface?.displayName, 'oh-my-codex');
     assert.equal(manifest.interface?.category, 'Developer Tools');
     assert.ok(manifest.interface?.shortDescription, 'expected short interface description');

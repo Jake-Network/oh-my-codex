@@ -36,7 +36,6 @@ interface PluginManifest {
 	name?: unknown;
 	version?: unknown;
 	skills?: unknown;
-	templates?: unknown;
 	hooks?: unknown;
 	mcpServers?: unknown;
 	apps?: unknown;
@@ -1277,9 +1276,6 @@ async function omxPluginCacheManifestProvenanceReason(
 	}
 	if (manifest.apps !== "./.app.json") {
 		return `plugin manifest apps pointer is not ./.app.json at ${manifestPath}`;
-	}
-	if (manifest.templates !== "./templates/") {
-		return `plugin manifest templates pointer is not ./templates/ at ${manifestPath}`;
 	}
 	return null;
 }
