@@ -3,6 +3,17 @@ import assert from "node:assert/strict";
 import TOML from "@iarna/toml";
 import { readTopLevelTomlString, upsertTopLevelTomlString } from "../toml.js";
 
+describe("quoted TOML string values", () => {
+  for (const quote of ['"', "'"]) {
+    for (const comment of ["", ' # "ignored" # comment']) {
+      it(`preserves hash characters with ${quote} quotes and comment ${JSON.stringify(comment)}`, () => {
+        const source = `model = ${quote}provider#model${quote}${comment}\n`;
+        assert.equal(readTopLevelTomlString(source, "model"), TOML.parse(source).model);
+      });
+    }
+  }
+});
+
 describe("quoted TOML table boundaries", () => {
   for (const delimiter of ["'''", '\"\"\"']) {
     for (const existing of [true, false]) {

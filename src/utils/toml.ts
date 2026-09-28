@@ -18,7 +18,7 @@ export function readTopLevelTomlString(
       continue;
     }
     if (!inTopLevel) continue;
-    const match = line.match(/^\s*([A-Za-z0-9_.-]+)\s*=\s*(.*?)\s*(?:#.*)?$/);
+    const match = line.match(/^\s*([A-Za-z0-9_.-]+)\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*'|[^#]*?)\s*(?:#.*)?$/);
     if (!match || match[1] !== key) continue;
     return parseTomlStringValue(match[2]);
   }
