@@ -23,8 +23,10 @@ async function withIsolatedUserHome<T>(
 }
 
 async function packagedPluginVersion(): Promise<string> {
+	const { packagedOmxPluginVersion } = await import("../plugin-marketplace.js");
 	const packaged = await resolvePackagedOmxMarketplace(packageRoot);
-	const version = packaged ? (await import("../plugin-marketplace.js")).packagedOmxPluginVersion(packaged) : null;
+	if (!packaged) throw new Error("Cannot resolve packaged marketplace");
+	const version = await packagedOmxPluginVersion(packaged);
 	if (!version) throw new Error("Cannot determine packaged plugin version");
 	return version;
 }
