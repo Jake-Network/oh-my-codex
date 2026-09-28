@@ -1579,4 +1579,65 @@ process.stdin.on('end', () => {
     assert.match(combined, /plugin-scoped companion metadata for official Codex lifecycle hooks/i);
     assert.match(combined, /legacy\/fallback native Codex hook registrations|legacy setup mode installs prompts\/native agents and \.codex\/hooks\.json/i);
   });
+
+  it('fails sync:plugin:check when plugin template is missing', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesPath = join(fixtureRoot, 'plugins', pluginName, 'templates', 'AGENTS.md');
+      // Remove the template file to simulate it being missing
+      await rm(pluginTemplatesPath);
+      // Should fail in check mode
+      let failed = false;
+      try {
+        const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+        await syncPluginMirror({ root: fixtureRoot, check: true });
+      } catch (e) {
+        failed = true;
+        const error = e instanceof Error ? e.message : String(e);
+        assert.match(error, /plugin_template_out_of_sync/);
+        assert.match(error, /missing/);
+      }
+      assert.equal(failed, true, 'expected check mode to fail when template is missing');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails sync:plugin:check when plugin template is stale', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesPath = join(fixtureRoot, 'plugins', pluginName, 'templates', 'AGENTS.md');
+      // Corrupt the template file to simulate it being stale
+      await writeFile(pluginTemplatesPath, 'corrupted content');
+      // Should fail in check mode
+      let failed = false;
+      try {
+        const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+        await syncPluginMirror({ root: fixtureRoot, check: true });
+      } catch (e) {
+        failed = true;
+        const error = e instanceof Error ? e.message : String(e);
+        assert.match(error, /plugin_template_out_of_sync/);
+        assert.match(error, /stale/);
+      }
+      assert.equal(failed, true, 'expected check mode to fail when template is stale');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('includes template changes in the changed result', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesPath = join(fixtureRoot, 'plugins', pluginName, 'templates', 'AGENTS.md');
+      // Remove the template file to simulate it being missing
+      await rm(pluginTemplatesPath);
+      // Sync should report changed=true even if skills and metadata already match
+      const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+      const result = await syncPluginMirror({ root: fixtureRoot, verbose: false });
+      assert.equal(result.changed, true, 'expected changed=true when template was missing and needed to be synced');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
 });

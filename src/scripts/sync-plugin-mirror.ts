@@ -185,6 +185,31 @@ function getPluginPaths(root: string): {
 	};
 }
 
+/**
+ * Compare the source and plugin template files
+ * Returns null if they match, otherwise returns a description of the difference
+ */
+async function comparePluginTemplate(
+	root: string,
+	pluginTemplatesDir: string,
+): Promise<string | null> {
+	const sourceTemplatePath = join(root, "templates", "AGENTS.md");
+	const pluginTemplatePath = join(pluginTemplatesDir, "AGENTS.md");
+
+	if (!existsSync(pluginTemplatePath)) {
+		return "missing";
+	}
+
+	const sourceContent = await readFile(sourceTemplatePath, "utf-8");
+	const pluginContent = await readFile(pluginTemplatePath, "utf-8");
+
+	if (sourceContent !== pluginContent) {
+		return "stale";
+	}
+
+	return null;
+}
+
 async function assertRootSkillCatalogConsistency(
 	root: string,
 	skillNames: readonly string[],
@@ -415,6 +440,18 @@ export async function syncPluginMirror(
 	if (options.check) {
 		await assertSkillMirror(rootSkillsDir, pluginSkillsDir, skillNames);
 		await assertPluginMetadata(root);
+		// Verify the plugin template matches the source template
+		const templateMismatch = await comparePluginTemplate(root, pluginTemplatesDir);
+		if (templateMismatch !== null) {
+			throw new Error(
+				[
+					"plugin_template_out_of_sync",
+					`reason=${templateMismatch}`,
+					`expected=templates/AGENTS.md`,
+					`actual=plugins/${PLUGIN_NAME}/templates/AGENTS.md`,
+				].join("\n"),
+			);
+		}
 		return { checked: true, mirroredSkillNames: skillNames, changed: false };
 	}
 
@@ -437,6 +474,7 @@ export async function syncPluginMirror(
 	}
 
 	// Sync templates directory to make plugin skill contract links resolve correctly
+	const beforeTemplateMatch = (await comparePluginTemplate(root, pluginTemplatesDir)) === null;
 	await rm(pluginTemplatesDir, { recursive: true, force: true });
 	await mkdir(pluginTemplatesDir, { recursive: true });
 	await cp(join(root, "templates", "AGENTS.md"), join(pluginTemplatesDir, "AGENTS.md"));
@@ -453,7 +491,7 @@ export async function syncPluginMirror(
 	return {
 		checked: false,
 		mirroredSkillNames: skillNames,
-		changed: !beforeSkillsMatch || metadataChanged,
+		changed: !beforeSkillsMatch || metadataChanged || !beforeTemplateMatch,
 	};
 }
 

@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 
 const root = process.cwd();
 const pluginName = 'oh-my-codex';
@@ -40,10 +40,12 @@ function resolvePathInPlugin(skillDir: string, relativePath: string): string {
  * Check if a resolved path is within the plugin root
  */
 function isPathInsidePluginRoot(path: string): boolean {
-	const relativePath = resolve(path);
+	const resolvedPath = resolve(path);
 	const pluginRootResolved = resolve(pluginRoot);
-	// Normalize both paths for comparison
-	return relativePath.startsWith(pluginRootResolved + '/') || relativePath === pluginRootResolved;
+	// Use relative() to check if the path is within the plugin root
+	// relative() returns a path starting with '..' if it's outside the target directory
+	const rel = relative(pluginRootResolved, resolvedPath);
+	return !rel.startsWith('..') && rel !== '';
 }
 
 describe('plugin skill contract links', () => {
