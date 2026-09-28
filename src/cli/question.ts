@@ -21,7 +21,11 @@ import {
   submitQuestionAnswerById,
   waitForQuestionTerminalState,
 } from '../question/state.js';
-import { isQuestionRendererAlive, launchQuestionRenderer } from '../question/renderer.js';
+import {
+  isQuestionRendererAlive,
+  launchQuestionRenderer,
+  QuestionRendererLaunchError,
+} from '../question/renderer.js';
 import { normalizeQuestionInput } from '../question/types.js';
 import { runQuestionUi } from '../question/ui.js';
 
@@ -378,10 +382,13 @@ export async function questionCommand(args: string[]): Promise<void> {
     });
   } catch (error) {
     const message = extractErrorMessage(error);
+    const code = error instanceof QuestionRendererLaunchError
+      ? error.code
+      : 'question_runtime_failed';
     const errorRecord = await markQuestionTerminalError(
       recordPath,
       'error',
-      'question_runtime_failed',
+      code,
       message,
     );
     await appendQuestionEvent(cwd, 'question-error', errorRecord, {
@@ -399,7 +406,7 @@ export async function questionCommand(args: string[]): Promise<void> {
       question_id: record.question_id,
       session_id: record.session_id,
       error: {
-        code: 'question_runtime_failed',
+        code,
         message,
       },
     }, parsed.json);
