@@ -174,6 +174,45 @@ if [[ "$RUN_REAL_TMUX_TESTS" == 1 ]]; then
   run_variant_case fixed "$FIXED_REPO" real-tmux-tests 1
 fi
 
+if [[ "$REQUIRED_FAILURE" == 1 ]]; then
+  echo "A required 1-session, 6-session, or real-tmux case was invalid" >&2
+  exit 1
+fi
+
+for label in baseline fixed; do
+  jq -e -s '
+    [.[] | select(.type == "metadata")] as $records
+    | ($records | length) > 0
+      and ($records | map(.source_hash) | unique | length) == 1
+      and ($records | map(.runtime_hash) | unique | length) == 1
+      and ($records | map(.commit) | unique | length) == 1
+      and ($records | all(.source_hash | test("^[0-9a-f]{64}$")))
+      and ($records | all(.runtime_hash | test("^[0-9a-f]{64}$")))
+  ' "$RESULTS_DIR/$label-cpu.jsonl" "$RESULTS_DIR/$label-diagnostic.jsonl" >/dev/null || {
+      echo "Inconsistent source or runtime identity for $label" >&2
+      exit 1
+    }
+  for count in 1 6; do
+    [[ ",${CASES}," == *",${count},"* ]] || continue
+    jq -e -s --argjson sessions "$count" --argjson repeats "$REPEATS" '
+      [.[] | select(.type == "cpu" and .sessions == $sessions)] as $samples
+      | ($samples | length) == $repeats
+        and ($samples | map(.repeat) | sort) == [range(1; $repeats + 1)]
+        and ($samples | all(.one_core_percent >= 0 and .pids_max_events >= 0))
+    ' "$RESULTS_DIR/$label-cpu.jsonl" >/dev/null || {
+      echo "Invalid CPU samples for $label with $count sessions" >&2
+      exit 1
+    }
+    jq -e -s --argjson sessions "$count" '
+      [.[] | select(.type == "diagnostic" and .sessions == $sessions)] as $records
+      | ($records | length) == 1 and $records[0].live_watchers == $sessions
+    ' "$RESULTS_DIR/$label-diagnostic.jsonl" >/dev/null || {
+      echo "Invalid diagnostic sample for $label with $count sessions" >&2
+      exit 1
+    }
+  done
+done
+
 jq -s '
   [ .[] | select(.type == "cpu") ]
   | group_by([.label, .sessions])
@@ -195,8 +234,4 @@ printf 'CPU summary: %s\n' "$RESULTS_DIR/cpu-summary.json"
 printf 'Diagnostic summary: %s\n' "$RESULTS_DIR/diagnostic-summary.json"
 if [[ "$RUN_REAL_TMUX_TESTS" == 1 ]]; then
   printf 'Real-tmux test results: %s\n' "$RESULTS_DIR/{baseline,fixed}-real-tmux-tests.jsonl"
-fi
-if [[ "$REQUIRED_FAILURE" == 1 ]]; then
-  echo "A required 1-session, 6-session, or real-tmux case was invalid" >&2
-  exit 1
 fi

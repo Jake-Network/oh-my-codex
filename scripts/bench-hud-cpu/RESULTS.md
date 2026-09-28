@@ -1,36 +1,47 @@
 # HUD idle CPU reproduction and validation
 
-## Environment and source identity
+## Source and environment
 
-- Host: macOS Docker Desktop, Linux kernel `6.10.14-linuxkit`.
-- Measurement container: Ubuntu 24.04, tmux 3.4, Node v22.20.0, two-CPU quota, 512-process limit.
-- Baseline revision: `c5ad2d02d72e7646b77a0315758a6c24cd6a9f46`.
-- Fixed runtime source SHA-256: `0d4d001e6323c8ff8c8b078f2ab068325a28458e0ff6b7ee9ea1cedeb26512df`.
-- Each variant and session count used its own container. Builds and the 10-second warmup finished before CPU sampling. Diagnostic instrumentation was disabled during CPU sampling.
-- CPU values are percentages of one full core, calculated from the cgroup `usage_usec` delta over 30 seconds. Each measured interval passed live-watcher, pane-topology, ownership, and hook verification. All twelve intervals reported `pids_max_events=0`.
+- Baseline: `official/dev` at `3ab9745e2bab24fa30a5307106ba43cbe7ea075e`.
+- Fixed HUD source SHA-256: `42351c5b6c2ccb87dff7b9b39839bc82f8fea6db4cd694554deba1eb4dc8844a`.
+- Ubuntu measurement: Docker Desktop on macOS, Ubuntu 24.04, tmux 3.4, Node v22.20.0, two-CPU quota, 512-process limit. Every variant and session count ran in an independent container with independent project directories.
+- Ubuntu sampling: 10-second warmup followed by three 20-second CPU intervals. The cgroup `usage_usec` delta yields percent of one full CPU core. All twelve intervals retained the requested live HUD watchers and recorded `pids_max_events=0`.
+- macOS host check: tmux 3.5a and Node v24.17.0, with a private tmux server for each run and 10-second warmup followed by a 20-second sample.
 
-## Reproduction results
+## Ubuntu CPU measurements
 
-- One HUD, baseline: `29.1218%`, `29.7189%`, `31.4455%`; median `29.7189%`.
-- One HUD, fixed: `4.2278%`, `4.4151%`, `4.4774%`; median `4.4151%`, an `85.14%` reduction.
-- Six HUDs, baseline: `200.7762%`, `200.7709%`, `201.3457%`; median `200.7762%`.
-- Six HUDs, fixed: `25.9263%`, `23.4930%`, `22.3581%`; median `23.4930%`, an `88.30%` reduction.
+- One HUD, baseline: `54.2176%`, `43.1118%`, `43.4317%`; median `43.4317%` of one core.
+- One HUD, fixed: `11.1493%`, `10.2493%`, `4.9339%`; median `10.2493%` of one core.
+- Six HUDs, baseline: `200.7014%`, `201.8193%`, `201.7904%`; median `201.7904%` of one core.
+- Six HUDs, fixed: `40.3738%`, `36.9371%`, `24.3696%`; median `36.9371%` of one core.
 
-The separately instrumented 15-second diagnostic intervals found:
+The median CPU reduction is `76.4%` with one HUD and `81.7%` with six HUDs in this two-CPU container. The six-HUD baseline reached the quota; its measured CPU cannot represent demand above two cores.
+
+Separately instrumented 15-second diagnostic intervals recorded:
 
 - One HUD, baseline: 15 `hud --reconcile-tmux` children, 45 `set-hook` calls, 150 tmux CLI calls, one live watcher.
 - One HUD, fixed: zero reconciliation children, zero `set-hook` calls, 90 tmux CLI calls, one live watcher.
-- Six HUDs, baseline: 91 reconciliation children, 258 `set-hook` calls, 883 tmux CLI calls, six live watchers.
-- Six HUDs, fixed: zero reconciliation children, zero `set-hook` calls, 546 tmux CLI calls, six live watchers.
+- Six HUDs, baseline: 34 reconciliation children, 132 `set-hook` calls, 438 tmux CLI calls, six live watchers.
+- Six HUDs, fixed: zero reconciliation children, zero `set-hook` calls, 576 tmux CLI calls, six live watchers.
 
-The steady-state parent watcher still performs read-only tmux checks; the measurements do not assert zero HUD CPU consumption.
+Diagnostic instrumentation was disabled during CPU sampling. The steady-state watcher still performs read-only tmux checks; the fix does not claim zero HUD CPU use.
 
-## Validation
+## macOS host measurements
 
-- Local build, lint, no-unused check, shell syntax, Node syntax, and `git diff --check`: passed.
-- Local HUD suites: 189 tests passed.
-- Ubuntu 24.04 / tmux 3.4: hook-health tests 2/2 and real-tmux HUD tests 10/10 passed.
-- Ubuntu 22.04 / tmux 3.2a: hook-health tests 2/2 and real-tmux HUD tests 10/10 passed with the same fixed runtime source hash.
-- The 19-HUD baseline did not yield a valid CPU sample during exploratory testing. It is excluded from numeric conclusions. The benchmark makes 19 HUDs opt-in and applies a process ceiling and external watchdog.
+The tracked `mac-cpu.mjs` sampler found:
 
-Raw local artifacts are under `.omx/bench/hud-cpu-final-ubuntu24-tmux34-20260928-v3/` for the baseline, `.omx/bench/hud-cpu-final-runtime-0d4d001e/` for the fixed version, and `.omx/bench/hud-marker-compat-ubuntu22-tmux32a-20260928/` for tmux 3.2a compatibility. Run `compare.sh` as described in `README.md` to generate fresh JSONL data and summaries.
+- One HUD, baseline: 20 reconciliation children and a `25.98%` one-core CPU lower bound.
+- One HUD, fixed: zero reconciliation children and a `1.35%` one-core CPU lower bound.
+- Six HUDs, baseline: 120 reconciliation children, 114 completed within the interval, and a `168.36%` one-core CPU lower bound.
+- Six HUDs, fixed: zero reconciliation children and a `5.40%` one-core CPU lower bound.
+
+The macOS figures include tmux-server and live-watcher CPU time plus completed reconciliation-child CPU time. Children still running when sampling ends are excluded, so the reported CPU figure is a lower bound. All requested watchers remained live throughout each run.
+
+## Functional checks
+
+- macOS: build, lint, no-unused check, and all 458 HUD tests passed. This includes real private-tmux split, layout, cross-window retirement, detached-session, and watch-publication tests.
+- Ubuntu 22.04 / tmux 3.2a: fixed hook-health tests and all 11 real-tmux HUD split tests passed.
+- Ubuntu 24.04 / tmux 3.4: fixed hook-health tests and all 11 real-tmux HUD split tests passed.
+- `git diff --check`, shell syntax, and macOS sampler Node syntax passed.
+
+Raw local measurements are in ignored `.omx/validation-cpu/docker-ubuntu24-final/` and `.omx/validation-cpu/mac-cpu-tracked.jsonl`. The benchmark and host reproduction commands are documented in `README.md`.

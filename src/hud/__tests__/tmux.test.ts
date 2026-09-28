@@ -252,7 +252,9 @@ describe('HUD resize hook helpers', () => {
     const registrations = registrationCalls.filter(args => args[0] === 'set-hook');
     const bySlot = new Map(registrations.map((args) => {
       const slotIndex = args[1] === '-w' ? 4 : 3;
-      return [args[slotIndex]!, { command: args[slotIndex + 1]!, identity: args.at(-1)! }];
+      const identityIndex = args.findIndex(value => value.startsWith('@omx_hook_identity_'));
+      assert.ok(identityIndex >= 0);
+      return [args[slotIndex]!, { command: args[slotIndex + 1]!, identity: args[identityIndex + 1]! }];
     }));
     const hookName = buildHudResizeHookName('$7', '@3', '%1');
     const slots = [
@@ -374,6 +376,20 @@ describe('HUD resize hook helpers', () => {
       const hookName = buildHudResizeHookName(leader[2]!, leader[3]!, leader[0]!);
       const resizeHookSlot = buildHudResizeHookSlot(hookName);
       tmux(['set-hook', '-t', leader[2]!, resizeHookSlot, 'display-message foreign']);
+      assert.equal(readHudHookHealth(input, tmux), 'repair_needed');
+      assert.equal(registerHudResizeHook(hud[0]!, leader[0], 3, input, tmux), true);
+      assert.equal(readHudHookHealth(input, tmux), 'healthy');
+      let replacedDuringRegistration = false;
+      const racingTmux = (args: string[]): string => {
+        const output = tmux(args);
+        if (!replacedDuringRegistration && args[0] === 'if-shell' && args.join(' ').includes(resizeHookSlot)) {
+          tmux(['set-hook', '-t', leader[2]!, resizeHookSlot, 'display-message foreign']);
+          replacedDuringRegistration = true;
+        }
+        return output;
+      };
+      assert.equal(registerHudResizeHook(hud[0]!, leader[0], 3, input, racingTmux), true);
+      assert.equal(replacedDuringRegistration, true);
       assert.equal(readHudHookHealth(input, tmux), 'repair_needed');
       assert.equal(registerHudResizeHook(hud[0]!, leader[0], 3, input, tmux), true);
       assert.equal(readHudHookHealth(input, tmux), 'healthy');
@@ -589,7 +605,9 @@ describe('HUD resize hook helpers', () => {
     const identitiesBySlot = new Map<string, string>();
     for (const args of registrationCalls.filter((call) => call[0] === 'set-hook')) {
       const slotIndex = args[1] === '-w' ? 4 : 3;
-      identitiesBySlot.set(args[slotIndex]!, args.at(-1)!);
+      const identityIndex = args.findIndex(value => value.startsWith('@omx_hook_identity_'));
+      assert.ok(identityIndex >= 0);
+      identitiesBySlot.set(args[slotIndex]!, args[identityIndex + 1]!);
     }
 
     const cleanupCalls: string[][] = [];
@@ -642,8 +660,13 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%10', '%1', 3, sameLeader), true);
     const recreatedResizeSlots = recreated.filter((args) => args[3]?.startsWith('client-resized['));
     assert.equal(recreatedResizeSlots[0]?.[3], recreatedResizeSlots[1]?.[3]);
-    assert.equal(recreated[0]?.at(-1), recreated[2]?.at(-1));
-    assert.equal(recreated[1]?.at(-1), recreated[3]?.at(-1));
+    const identity = (args: string[]) => {
+      const index = args.findIndex(value => value.startsWith('@omx_hook_identity_'));
+      assert.ok(index >= 0);
+      return args[index + 1];
+    };
+    assert.equal(identity(recreated[0]!), identity(recreated[2]!));
+    assert.equal(identity(recreated[1]!), identity(recreated[3]!));
   });
 });
 

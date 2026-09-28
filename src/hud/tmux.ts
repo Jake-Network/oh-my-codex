@@ -841,35 +841,20 @@ function hudHookConfigurationToken(context: HudResizeHookContext, hookSlot: stri
   ])).digest('hex');
 }
 
-function recordHudHookExpectedCommand(
+function buildHudHookRegistrationSuffix(
   context: HudResizeHookContext,
   hookSlot: string,
   heightLines: number,
   cwd: string,
-  execTmuxSync: TmuxExecSync,
-  authority?: HudTmuxMutationAuthority,
-): boolean {
-  const canonicalCommand = parseExactTmuxAuthorityScalar(execTmuxSync([
-    'display-message', '-p', '-t', context.leaderPaneId, `#{${hookSlot}}`,
-  ]));
-  if (!canonicalCommand) throw new Error('invalid_tmux_hook_command');
-  const commands = [
-    `set-option -t ${context.sessionId} ${hudHookExpectedCommandOption(hookSlot)} ${shellEscapeSingle(canonicalCommand)}`,
-    `set-option -t ${context.sessionId} ${hudHookConfigurationOption(hookSlot)} ${hudHookConfigurationToken(context, hookSlot, heightLines, cwd)}`,
-  ].join(' ; ');
-  if (authority) return executeHudCommandUnderAuthority(authority, commands, execTmuxSync);
-  execTmuxSync(['set-option', '-t', context.sessionId, hudHookExpectedCommandOption(hookSlot), canonicalCommand]);
-  execTmuxSync([
-    'set-option', '-t', context.sessionId,
-    hudHookConfigurationOption(hookSlot), hudHookConfigurationToken(context, hookSlot, heightLines, cwd),
-  ]);
-  return true;
-}
-
-function buildHudHookRegistrationSuffix(context: HudResizeHookContext, hookSlot: string): string[] {
+): string[] {
+  const formatTarget = hookSlot.startsWith('window-layout-changed[') ? context.windowId : context.sessionId;
   return [
     ';', 'set-option', '-t', context.sessionId,
     hudHookIdentityOption(hookSlot), hudHookIdentityToken(context.hookName, hookSlot),
+    ';', 'set-option', '-F', '-t', formatTarget,
+    hudHookExpectedCommandOption(hookSlot), `#{${hookSlot}}`,
+    ';', 'set-option', '-t', context.sessionId,
+    hudHookConfigurationOption(hookSlot), hudHookConfigurationToken(context, hookSlot, heightLines, cwd),
   ];
 }
 
@@ -1099,11 +1084,13 @@ function buildHudHookRegistrationCommand(
   hookSlot: string,
   registrationCommand: string,
   context: HudResizeHookContext,
+  heightLines: number,
+  cwd: string,
 ): string {
   return [
     'set-hook', ...targetArgs, hookSlot, shellEscapeSingle(registrationCommand),
-    ';', 'set-option', '-t', context.sessionId,
-    hudHookIdentityOption(hookSlot), hudHookIdentityToken(context.hookName, hookSlot),
+    ...buildHudHookRegistrationSuffix(context, hookSlot, heightLines, cwd)
+      .map(token => token === `#{${hookSlot}}` ? shellEscapeSingle(token) : token),
   ].join(' ');
 }
 
@@ -2147,6 +2134,7 @@ export function registerHudResizeHook(
   if (repairRegistration && !mutationAuthority) return false;
   const tmuxBin = resolveTmuxBinaryForPlatform() || 'tmux';
   const height = String(Math.max(1, Math.floor(heightLines)));
+  const registrationCwd = options.cwd?.trim() || process.cwd();
   const resizeCmd = shellEscapeSingle(buildHudResizeHookCommand(tmuxBin, canonicalHudPaneId, height, ownedContext, options.env?.TMUX));
   const omxBin = resolveOmxCliEntryPath({ cwd: options.cwd, env: options.env });
   try {
@@ -2159,13 +2147,14 @@ export function registerHudResizeHook(
           ownedContext.hookSlot,
           resizeRegistrationCommand,
           ownedContext,
+          Number(height),
+          registrationCwd,
         ),
         execTmuxSync,
       )) return false;
     } else {
-      execTmuxSync(['set-hook', '-t', ownedContext.sessionId, ownedContext.hookSlot, resizeRegistrationCommand, ...buildHudHookRegistrationSuffix(ownedContext, ownedContext.hookSlot)]);
+      execTmuxSync(['set-hook', '-t', ownedContext.sessionId, ownedContext.hookSlot, resizeRegistrationCommand, ...buildHudHookRegistrationSuffix(ownedContext, ownedContext.hookSlot, Number(height), registrationCwd)]);
     }
-    if (!recordHudHookExpectedCommand(ownedContext, ownedContext.hookSlot, Number(height), options.cwd?.trim() || process.cwd(), execTmuxSync, mutationAuthority)) return false;
     unregisterLegacyHudResizeHook(ownedContext, execTmuxSync);
   } catch {
     return false;
@@ -2183,13 +2172,12 @@ export function registerHudResizeHook(
         if (mutationAuthority) {
           if (!executeHudCommandUnderAuthority(
             mutationAuthority,
-            buildHudHookRegistrationCommand(targetArgs, hookSlot, registrationCommand, ownedContext),
+            buildHudHookRegistrationCommand(targetArgs, hookSlot, registrationCommand, ownedContext, Number(height), registrationCwd),
             execTmuxSync,
           )) return false;
         } else {
-          execTmuxSync(['set-hook', ...targetArgs, hookSlot, registrationCommand, ...buildHudHookRegistrationSuffix(ownedContext, hookSlot)]);
+          execTmuxSync(['set-hook', ...targetArgs, hookSlot, registrationCommand, ...buildHudHookRegistrationSuffix(ownedContext, hookSlot, Number(height), registrationCwd)]);
         }
-        if (!recordHudHookExpectedCommand(ownedContext, hookSlot, Number(height), options.cwd?.trim() || process.cwd(), execTmuxSync, mutationAuthority)) return false;
       }
     } catch {
       // Keep the resize hook installed so older tmux builds still recover on

@@ -52,6 +52,19 @@ Every CPU sample reads `pids.events` around the measured interval. If the proces
 
 The benchmark intentionally uses independent Git repositories as each HUD's working directory. This prevents a shared `.omx/state/hud-reconcile.lock` from serializing the fault and hiding per-watcher CPU cost.
 
+## macOS host check
+
+Build both source trees on macOS, then run the host sampler from the fixed repository while other benchmark runs are idle:
+
+```bash
+node scripts/bench-hud-cpu/mac-cpu.mjs /absolute/path/to/baseline/dist/cli/omx.js 1 baseline
+node scripts/bench-hud-cpu/mac-cpu.mjs dist/cli/omx.js 1 fixed
+node scripts/bench-hud-cpu/mac-cpu.mjs /absolute/path/to/baseline/dist/cli/omx.js 6 baseline
+node scripts/bench-hud-cpu/mac-cpu.mjs dist/cli/omx.js 6 fixed
+```
+
+Each run creates independent working directories and live HUD watchers on a private tmux server, waits 10 seconds, and samples for 20 seconds. It records watcher and tmux-server CPU time with `ps`, plus completed `hud --reconcile-tmux` child CPU time using `NODE_OPTIONS`. The reported `oneCorePercentLowerBound` excludes children still running when the interval ends. The trace and project fixtures remain under ignored `.omx/bench/hud-cpu-mac/` for inspection. The sampler terminates its private tmux server on exit.
+
 ## tmux version matrix
 
 Run the complete comparison for each environment. Keep CPU conclusions within one environment; different Ubuntu and tmux builds are compatibility evidence, not paired performance samples.
