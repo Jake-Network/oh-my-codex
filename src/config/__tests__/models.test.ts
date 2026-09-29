@@ -401,7 +401,7 @@ describe('getModelForMode', () => {
   });
 
   it('recognizes the GPT-6 family without inferring unannounced aliases', () => {
-    for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']) {
+    for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna']) {
       assert.equal(isKnownCodexModelAlias(model), true, model);
     }
     assert.equal(isKnownCodexModelAlias('gpt-6-terra'), false);
