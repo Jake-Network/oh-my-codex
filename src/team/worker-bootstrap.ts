@@ -41,36 +41,6 @@ interface WorkerRootAgentsOptions {
   toolContext?: WorktreeToolContext;
 }
 
-interface WorkerRootAgentsBackup {
-  existed: boolean;
-  tracked: boolean;
-  previousContent?: string;
-  skipWorktreeApplied?: boolean;
-}
-
-function buildWorkerRootAgentsBackupPath(
-  teamStateRoot: string,
-  teamName: string,
-  workerName: string,
-  worktreePath: string,
-): string {
-  const gitPath = tryReadGitValue(worktreePath, [
-    "rev-parse",
-    "--git-path",
-    "omx/root-agents-backup.json",
-  ]);
-  return gitPath
-    ? gitPath
-    : join(
-        teamStateRoot,
-        "team",
-        teamName,
-        "workers",
-        workerName,
-        "root-agents-backup.json",
-      );
-}
-
 export function generateWorkerRootAgentsContent(
   options: WorkerRootAgentsOptions,
 ): string {
@@ -153,39 +123,6 @@ function tryReadGitValue(cwd: string, args: string[]): string | null {
   }
 }
 
-function isTracked(worktreePath: string, fileName: string): boolean {
-  try {
-    execFileSync("git", ["ls-files", "--error-unmatch", fileName], {
-      cwd: worktreePath,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function ensureGitInfoExcludePattern(
-  worktreePath: string,
-  pattern: string,
-): Promise<void> {
-  const excludePath = tryReadGitValue(worktreePath, [
-    "rev-parse",
-    "--git-path",
-    "info/exclude",
-  ]);
-  if (!excludePath) return;
-  const existing = existsSync(excludePath)
-    ? await readFile(excludePath, "utf-8")
-    : "";
-  const lines = new Set(existing.split(/\r?\n/).filter(Boolean));
-  if (lines.has(pattern)) return;
-  const next = `${existing}${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}${pattern}\n`;
-  await mkdir(dirname(excludePath), { recursive: true });
-  await writeFile(excludePath, next, "utf-8");
-}
 async function buildWorkerRootAgentsContent(
   options: WorkerRootAgentsOptions,
   projectAgentsContent: string | undefined,
@@ -226,50 +163,29 @@ async function buildWorkerRootAgentsContent(
 export async function writeWorkerWorktreeRootAgentsFile(
   options: WorkerRootAgentsOptions,
 ): Promise<string> {
+  // Write worker runtime instructions to a team-scoped location in .omx state,
+  // not to the worker's tracked AGENTS.md. This ensures checkout/merge operations
+  // never commit OMX-injected runtime instructions to the leader's branch.
   const agentsPath = join(options.worktreePath, "AGENTS.md");
-  const tracked = isTracked(options.worktreePath, "AGENTS.md");
-  const existed = existsSync(agentsPath);
-  const previousContent = existed
+  const previousContent = existsSync(agentsPath)
     ? await readFile(agentsPath, "utf-8")
     : undefined;
-  let skipWorktreeApplied = false;
 
-  if (tracked) {
-    try {
-      execFileSync("git", ["update-index", "--skip-worktree", "AGENTS.md"], {
-        cwd: options.worktreePath,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-      skipWorktreeApplied = true;
-    } catch {
-      skipWorktreeApplied = false;
-    }
-  } else {
-    await ensureGitInfoExcludePattern(options.worktreePath, "AGENTS.md");
-  }
-
-  const backup: WorkerRootAgentsBackup = {
-    existed,
-    tracked,
-    previousContent,
-    skipWorktreeApplied,
-  };
-  const backupPath = buildWorkerRootAgentsBackupPath(
+  const outPath = join(
     options.teamStateRoot,
+    "team",
     options.teamName,
+    "workers",
     options.workerName,
-    options.worktreePath,
+    "AGENTS.md",
   );
-  await mkdir(dirname(backupPath), { recursive: true });
-  await writeFile(backupPath, JSON.stringify(backup, null, 2), "utf-8");
+  await mkdir(dirname(outPath), { recursive: true });
   await writeFile(
-    agentsPath,
+    outPath,
     await buildWorkerRootAgentsContent(options, previousContent),
     "utf-8",
   );
-  return agentsPath;
+  return outPath;
 }
 
 export async function removeWorkerWorktreeRootAgentsFile(
@@ -278,47 +194,16 @@ export async function removeWorkerWorktreeRootAgentsFile(
   teamStateRoot: string,
   worktreePath: string,
 ): Promise<void> {
-  const agentsPath = join(worktreePath, "AGENTS.md");
-  const backupPath = buildWorkerRootAgentsBackupPath(
+  // Remove the team-scoped worker instructions file from .omx state.
+  const outPath = join(
     teamStateRoot,
+    "team",
     teamName,
+    "workers",
     workerName,
-    worktreePath,
+    "AGENTS.md",
   );
-  let backup: WorkerRootAgentsBackup | null = null;
-
-  try {
-    backup = JSON.parse(
-      await readFile(backupPath, "utf-8"),
-    ) as WorkerRootAgentsBackup;
-  } catch {
-    backup = null;
-  }
-
-  if (!backup) {
-    return;
-  }
-
-  if (backup.tracked && backup.skipWorktreeApplied) {
-    try {
-      execFileSync("git", ["update-index", "--no-skip-worktree", "AGENTS.md"], {
-        cwd: worktreePath,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    } catch {
-      // Best-effort cleanup only.
-    }
-  }
-
-  if (backup.existed) {
-    await writeFile(agentsPath, backup.previousContent ?? "", "utf-8");
-  } else {
-    await rm(agentsPath, { force: true }).catch(() => {});
-  }
-
-  await rm(backupPath, { force: true }).catch(() => {});
+  await rm(outPath, { force: true }).catch(() => {});
 }
 
 function buildVerificationSection(taskDescription: string): string {
