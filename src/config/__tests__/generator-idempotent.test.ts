@@ -288,7 +288,7 @@ describe("config generator idempotency (#384)", () => {
 
       assertSingleOmxBlock(toml);
       assert.doesNotMatch(toml, /^multi_agent\s*=/m);
-      assert.match(toml, /^child_agents_md = true$/m);
+      assert.doesNotMatch(toml, /^child_agents_md\s*=/m);
       assert.match(toml, /^hooks = true$/m);
       assert.match(toml, /^goals = true$/m);
       assert.doesNotMatch(toml, /^\[agents\]$/m);
@@ -384,6 +384,7 @@ describe("config generator idempotency (#384)", () => {
       "[features]\nmulti_agent = false\nchild_agents_md = true\nhooks = true\ngoals = true\n",
       { preserveMultiAgent: true },
     );
+    assert.doesNotMatch(stripped, /child_agents_md/);
 
     assert.equal(stripped, "[features]\nmulti_agent = false\n");
   });

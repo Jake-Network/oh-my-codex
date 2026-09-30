@@ -185,7 +185,6 @@ function detectOmxConfigArtifacts(config: string): {
     /^\s*developer_instructions\s*=.*oh-my-codex/m.test(config);
 
   const hasFeatureFlags =
-    /^\s*child_agents_md\s*=\s*true/m.test(config) ||
     /^\s*hooks\s*=\s*true/m.test(config) ||
     /^\s*codex_hooks\s*=\s*true/m.test(config) ||
     /^\s*goals\s*=\s*true/m.test(config) ||
@@ -1787,7 +1786,7 @@ function printSummary(summary: UninstallSummary, dryRun: boolean): void {
     }
     if (summary.featureFlagsRemoved) {
       console.log(
-        "    Feature flags (child_agents_md, goals; multi_agent and hooks are preserved when user-owned)",
+        "    Feature flags (goals; multi_agent and hooks are preserved when user-owned)",
       );
     }
   } else if (summary.mcpServersRemoved.length === 0) {
