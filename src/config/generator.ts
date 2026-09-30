@@ -916,7 +916,6 @@ function upsertFeatureFlags(
     const base = config.trimEnd();
     const featureBlock = [
       "[features]",
-      "child_agents_md = true",
       hookFeatureFlagLine,
       "goals = true",
       "",
@@ -935,26 +934,12 @@ function upsertFeatureFlags(
     }
   }
 
-  // Remove deprecated collab and unreleased singular goal flags.
+  // Remove deprecated collab, singular goal flags, and obsolete child_agents_md (Codex 0.159.2+).
   for (let i = sectionEnd - 1; i > featuresStart; i--) {
-    if (/^\s*(?:collab|goal)\s*=/.test(lines[i])) {
+    if (/^\s*(?:collab|goal|child_agents_md)\s*=/.test(lines[i])) {
       lines.splice(i, 1);
       sectionEnd -= 1;
     }
-  }
-
-  let childAgentsIdx = -1;
-  for (let i = featuresStart + 1; i < sectionEnd; i++) {
-    if (/^\s*child_agents_md\s*=/.test(lines[i])) {
-      childAgentsIdx = i;
-    }
-  }
-
-  if (childAgentsIdx >= 0) {
-    lines[childAgentsIdx] = "child_agents_md = true";
-  } else {
-    lines.splice(sectionEnd, 0, "child_agents_md = true");
-    sectionEnd += 1;
   }
 
   ({ sectionEnd } = upsertCodexHookFeatureFlagInSection(
@@ -4201,7 +4186,7 @@ function getOmxTablesBlock(
  *
  * Layout:
  *   1. OMX top-level keys (notify, model_reasoning_effort, developer_instructions)
- *   2. [features] with child_agents_md + hooks + goals
+ *   2. [features] with hooks + goals
  *   3. [shell_environment_policy.set] with defaulted deprecated explore-routing opt-out
  *   4. … user sections …
  *   5. OMX [table] sections (mcp_servers, tui)

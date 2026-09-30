@@ -143,7 +143,7 @@ describe('config generator', () => {
       // Features correct
       assert.equal((rerun.match(/^\[features\]$/gm) ?? []).length, 1);
       assert.doesNotMatch(rerun, /^multi_agent\s*=/m);
-      assert.match(rerun, /^child_agents_md = true$/m);
+      assert.doesNotMatch(rerun, /^child_agents_md\s*=/m);
 
       // User content preserved
       assert.match(rerun, /^\[user.settings\]$/m);
@@ -343,7 +343,7 @@ describe('config generator', () => {
       assert.equal((merged.match(/^\[features\]$/gm) ?? []).length, 1);
       assert.match(merged, /^custom_user_flag = false$/m);
       assert.doesNotMatch(merged, /^multi_agent\s*=/m);
-      assert.match(merged, /^child_agents_md = true$/m);
+      assert.doesNotMatch(merged, /^child_agents_md\s*=/m);
       assert.match(merged, /^hooks = true$/m);
       assert.match(merged, /^goals = true$/m);
       assert.doesNotMatch(merged, /^goal\s*=/m);
