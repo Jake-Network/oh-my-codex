@@ -2,7 +2,6 @@ import type { TeamTask, TeamTaskCoordinationMechanism } from "./state.js";
 import { existsSync } from "fs";
 import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { dirname, join } from "path";
-import { execFileSync } from "child_process";
 import {
   getFixLoopInstructions,
   getVerificationInstructions,
@@ -109,20 +108,6 @@ ${options.rolePromptContent.trim()}
 `;
 }
 
-function tryReadGitValue(cwd: string, args: string[]): string | null {
-  try {
-    const value = execFileSync("git", args, {
-      cwd,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    }).trim();
-    return value || null;
-  } catch {
-    return null;
-  }
-}
-
 async function buildWorkerRootAgentsContent(
   options: WorkerRootAgentsOptions,
   projectAgentsContent: string | undefined,
@@ -194,7 +179,41 @@ export async function removeWorkerWorktreeRootAgentsFile(
   teamStateRoot: string,
   worktreePath: string,
 ): Promise<void> {
-  // Remove the team-scoped worker instructions file from .omx state.
+  // Restore the worktree's original AGENTS.md from backup, if it exists.
+  const backupPath = join(
+    teamStateRoot,
+    "team",
+    teamName,
+    "workers",
+    workerName,
+    "root-agents-backup.json",
+  );
+  const worktreeAgentsPath = join(worktreePath, "AGENTS.md");
+  
+  // Check if backup file exists and restore from it
+  if (existsSync(backupPath)) {
+    try {
+      const backupContent = await readFile(backupPath, "utf-8");
+      const backup = JSON.parse(backupContent) as {
+        existed?: boolean;
+        previousContent?: string;
+      };
+      
+      if (backup.existed && backup.previousContent) {
+        // Restore the original content
+        await writeFile(worktreeAgentsPath, backup.previousContent, "utf-8");
+      } else if (!backup.existed) {
+        // File didn't exist originally, remove it
+        await rm(worktreeAgentsPath, { force: true }).catch(() => {});
+      }
+    } catch {
+      // Backup file is malformed, just clean up without restoring
+    }
+    // Clean up the backup file
+    await rm(backupPath, { force: true }).catch(() => {});
+  }
+  
+  // Clean up the generated worker instructions file from .omx state
   const outPath = join(
     teamStateRoot,
     "team",

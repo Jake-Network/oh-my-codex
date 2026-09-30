@@ -2070,7 +2070,7 @@ exit 0
       assert.doesNotMatch(inbox, /## Your Specialization/);
       assert.match(inbox, /\*\*Role:\*\* writer/);
 
-      const rootAgents = await readFile(join(cwd, '.omx', 'team', 'canonical-root', 'worktrees', 'worker-2', 'AGENTS.md'), 'utf-8');
+      const rootAgents = await readFile(join(cwd, '.omx', 'state', 'team', 'canonical-root', 'workers', 'worker-2', 'AGENTS.md'), 'utf-8');
       assert.match(rootAgents, /You are operating as the \*\*writer\*\* role/);
       assert.match(rootAgents, /<identity>You are Writer\.<\/identity>/);
       assert.match(rootAgents, /exact gpt-5\.6-terra model/);
@@ -2272,7 +2272,7 @@ exit 0
       assert.equal(result.ok, true);
       if (!result.ok) return;
 
-      const rootAgents = await readFile(join(cwd, '.omx', 'team', 'mini-tuned-root', 'worktrees', 'worker-2', 'AGENTS.md'), 'utf-8');
+      const rootAgents = await readFile(join(cwd, '.omx', 'state', 'team', 'mini-tuned-root', 'workers', 'worker-2', 'AGENTS.md'), 'utf-8');
       assert.match(rootAgents, /You are operating as the \*\*writer\*\* role/);
       assert.match(rootAgents, /<identity>You are Writer\.<\/identity>/);
       assert.doesNotMatch(rootAgents, /exact gpt-5\.6-terra model/);
