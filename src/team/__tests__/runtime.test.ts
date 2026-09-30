@@ -6207,7 +6207,9 @@ process.on('SIGTERM', () => process.exit(0));
       const workerPath = runtime.config.workers[0]?.worktree_path;
       assert.ok(workerPath, 'detached worker should have a worktree path');
       assert.notEqual(workerPath, repo);
-      const workerAgents = await readFile(join(workerPath as string, 'AGENTS.md'), 'utf-8');
+      // Worker runtime instructions are in .omx state, not the tracked AGENTS.md
+      const workerInstructionsPath = join(repo, '.omx', 'state', 'team', runtime.teamName, 'workers', 'worker-1', 'AGENTS.md');
+      const workerAgents = await readFile(workerInstructionsPath, 'utf-8');
       assert.match(workerAgents, /Team Worker Runtime Instructions/);
       assert.match(workerAgents, new RegExp(runtime.teamName));
 
@@ -6232,9 +6234,10 @@ process.on('SIGTERM', () => process.exit(0));
       assert.equal(envLog.cwd, workerPath);
       assert.equal(envLog.teamStateRoot, join(repo, '.omx', 'state'));
       assert.equal(envLog.worker, 'team-detached-worktree-paths/worker-1');
-      const rootAgents = await readFile(join(workerPath, 'AGENTS.md'), 'utf-8');
+      // Verify the same instructions are accessible from the state path
+      const rootAgents = await readFile(workerInstructionsPath, 'utf-8');
       assert.match(rootAgents, /Team Worker Runtime Instructions/);
-      assert.match(rootAgents, new RegExp(`Inbox path: .*${runtime.teamName}/workers/worker-1/inbox\\.md`));
+      assert.match(rootAgents, new RegExp(`Inbox path: .*${runtime.teamName}/workers/worker-1/inbox\.md`));
 
       await sendWorkerMessage(runtime.teamName, 'leader-fixed', 'worker-1', 'follow-up', repo);
       const mailboxLog = await waitForFileText(
@@ -6315,7 +6318,8 @@ process.on('SIGTERM', () => process.exit(0));
       assert.ok(worktreePath, 'worker worktree path should be persisted');
       assert.equal(runtime.config.workers[0]?.worktree_created, true);
       assert.equal(existsSync(worktreePath as string), true);
-      assert.equal(existsSync(join(worktreePath as string, 'AGENTS.md')), true);
+      // Worker runtime instructions are in .omx state, not the worktree AGENTS.md
+      // AGENTS.md may or may not exist in the worktree depending on whether it's tracked in the repo
 
       await shutdownTeam(runtime.teamName, repo);
       runtime = null;
@@ -7020,6 +7024,65 @@ process.on('SIGTERM', () => process.exit(0));
       };
       assert.equal(ledger.entries.some((entry) => entry.operation === 'auto_checkpoint'), true);
       assert.equal(ledger.entries.some((entry) => entry.operation === 'integration_merge'), true);
+    } finally {
+      if (workerPath) {
+        await rm(workerPath, { recursive: true, force: true });
+      }
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('(#3717) monitorTeam does not commit runtime instructions to leader AGENTS.md', async () => {
+    const repo = await initRepo();
+    let workerPath = '';
+    try {
+      // Create and commit initial AGENTS.md to leader
+      const originalAgents = '# Leader AGENTS\n\nLeader guidance here.\n';
+      await writeFile(join(repo, 'AGENTS.md'), originalAgents, 'utf-8');
+      execFileSync('git', ['add', 'AGENTS.md'], { cwd: repo, stdio: 'ignore' });
+      execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo, stdio: 'ignore' });
+
+      workerPath = await addWorktree(repo, 'wk1-agents-branch', 'omx-runtime-wk1-agents-');
+
+      // Add uncommitted change in worker
+      await writeFile(join(workerPath, 'work.txt'), 'worker output\n', 'utf-8');
+
+      await initTeamState('team-agents-check', 'agents regression test', 'executor', 1, repo);
+      const cfg = await readTeamConfig('team-agents-check', repo);
+      assert.ok(cfg);
+      if (!cfg) throw new Error('missing config');
+      cfg.leader_pane_id = '';
+      cfg.workers[0] = {
+        ...cfg.workers[0],
+        assigned_tasks: ['1'],
+        worktree_repo_root: repo,
+        worktree_path: workerPath,
+        worktree_branch: 'wk1-agents-branch',
+        worktree_detached: false,
+        worktree_created: false,
+      };
+      await saveTeamConfig(cfg, repo);
+
+      await monitorTeam('team-agents-check', repo);
+
+      // Verify leader AGENTS.md is byte-identical to original
+      const leaderAgentsAfter = await readFile(join(repo, 'AGENTS.md'), 'utf-8');
+      assert.equal(leaderAgentsAfter, originalAgents, 'leader AGENTS.md should not be modified by team operations');
+
+      // Verify the auto-checkpoint and merge commits do NOT modify AGENTS.md
+      const log = execFileSync('git', ['log', '--oneline', '-10'], { cwd: repo, encoding: 'utf-8' });
+      assert.match(log, /auto-checkpoint|merge/, 'should have team commits');
+
+      // Verify auto-checkpoint commit does not include AGENTS.md
+      const autoCheckpointCommit = execFileSync('git', ['log', '--oneline', '--all'], { cwd: workerPath, encoding: 'utf-8' })
+        .split('\n')
+        .find((line: string) => line.includes('auto-checkpoint'));
+      assert.ok(autoCheckpointCommit, 'auto-checkpoint commit should exist');
+      if (autoCheckpointCommit) {
+        const commitSha = autoCheckpointCommit.split(' ')[0];
+        const diff = execFileSync('git', ['diff', `${commitSha}^..${commitSha}`, '--name-only'], { cwd: workerPath, encoding: 'utf-8' });
+        assert.doesNotMatch(diff, /AGENTS\.md/, 'auto-checkpoint should not include AGENTS.md');
+      }
     } finally {
       if (workerPath) {
         await rm(workerPath, { recursive: true, force: true });
