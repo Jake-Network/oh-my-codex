@@ -4537,18 +4537,127 @@ function detachedFailureCode(error: unknown): string {
 }
 
 
+function sanitizeDetachedFailureText(text: string): string {
+  // Drop terminal escape sequences (CSI/OSC), then every remaining C0/C1 control byte,
+  // and collapse whitespace.
+  const collapsed = text
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|\u001b\[[0-?]*[ -/]*[@-~]|\u001b[@-_]/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  // Redact absolute paths: Unix /path/to/file and Windows C:\path\to\file
+  const pathRedacted = collapsed.replace(/(?<![\w.])(?:\/[^\s:/]+)+\/?|[a-zA-Z]:\\[^\s]+/g, "[path]");
+  // Redact secrets: bearer tokens, API keys, JWTs, and other common secret patterns
+  const secretRedacted = pathRedacted.replace(
+    /(digest\s+(?:[a-z0-9_-]+=(?:"(?:\\.|[^"\\])*"?|[^\s,"]+)(?:\s*,\s*)?)+|(?:bearer|basic|digest|token)\s+[^\s"'`]+|sk-[a-z0-9_-]{8,}|gh[pousr]_[a-z0-9]{8,}|github_pat_[a-z0-9_]{8,}|eyj[a-z0-9._-]{10,}|[a-f0-9]{32,})/gi,
+    "[redacted]"
+  )
+    // Key-labelled credentials (`api_key=…`, `password: …`): keep the label, drop the value.
+    .replace(
+      /\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|secret|token|password|passwd|pwd|credentials?|auth)["']?)(\s*[=:]\s*)(?!\[redacted\])(?:"(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?|`(?:\\.|[^`\\])*`?|[^\s"'`]+)/gi,
+      "$1$2[redacted]",
+    );
+  return secretRedacted;
+}
+
+interface DetachedFailureSegment {
+  stderr?: string;
+  status?: number;
+  signal?: string;
+  code?: string;
+}
+
+// One segment per nested error (AggregateError children / cause chain, bounded depth) that
+// carries stderr or exit metadata, so each process result stays attributed to its own error.
+function collectDetachedFailureSegments(
+  value: unknown,
+  depth: number = 0,
+  segments: DetachedFailureSegment[] = [],
+): DetachedFailureSegment[] {
+  if (depth > 4 || !value || typeof value !== "object") return segments;
+  const err = value as { stderr?: unknown; status?: unknown; signal?: unknown; code?: unknown; cause?: unknown };
+  const stderr = typeof err.stderr === "string" ? err.stderr : (err.stderr as { toString?: () => string } | undefined)?.toString?.();
+  const segment: DetachedFailureSegment = {
+    ...(stderr ? { stderr } : {}),
+    ...(typeof err.status === "number" ? { status: err.status } : {}),
+    // Only known identifiers are reported: OS signal names, OS errno names, or Node `ERR_*` codes.
+    // Any other value is dropped, never echoed.
+    ...(typeof err.signal === "string" && Object.hasOwn(osConstants.signals, err.signal) ? { signal: err.signal } : {}),
+    ...(typeof err.code === "string" && (Object.hasOwn(osConstants.errno, err.code) || /^ERR_[A-Z0-9_]{1,60}$/.test(err.code))
+      ? { code: err.code }
+      : {}),
+  };
+  if (Object.keys(segment).length > 0) segments.push(segment);
+  if (value instanceof AggregateError) {
+    for (const child of value.errors) collectDetachedFailureSegments(child, depth + 1, segments);
+  }
+  if (err.cause) collectDetachedFailureSegments(err.cause, depth + 1, segments);
+  return segments;
+}
+
+const DETACHED_FAILURE_MAX_CHARS = 1_024;
+const DETACHED_FAILURE_STDERR_MAX_CHARS = 256;
+const DETACHED_FAILURE_MESSAGE_RESERVE = 128;
+const DETACHED_FAILURE_SEPARATOR = " | ";
+
+// `execFileSync` messages are `Command failed: <argv joined by spaces>\n<stderr>`. Argument
+// boundaries are lost, so no per-argument redaction is safe (`-e KEY=alpha beta`); keep only
+// the executable and its subcommand. Stderr is reported separately.
+function redactFailedCommandArgv(message: string): string {
+  const match = /^Command failed: (\S+)(?: ([a-z][a-z-]*))?/.exec(message);
+  if (!match) return message;
+  return `Command failed: ${match[1]}${match[2] ? ` ${match[2]}` : ""} [argv redacted]`;
+}
+
 export function describeDetachedLeaderFailure(error: unknown): string {
+  const segments = collectDetachedFailureSegments(error);
+  const metadataOf = (segment: DetachedFailureSegment): string[] => [
+    ...(segment.status !== undefined ? [`status=${segment.status}`] : []),
+    ...(segment.signal !== undefined ? [`signal=${segment.signal}`] : []),
+    ...(segment.code !== undefined ? [`code=${segment.code}`] : []),
+  ];
+  // Exit metadata and a message reserve are budgeted first; stderr shares only what remains,
+  // so no amount of aggregated stderr can push exit metadata past the output cap.
+  const metadataChars = segments
+    .flatMap(metadataOf)
+    .reduce((total, field) => total + field.length + DETACHED_FAILURE_SEPARATOR.length, 0);
+  const stderrSegments = segments.filter((segment) => segment.stderr).length;
+  const stderrBudget = Math.max(
+    0,
+    DETACHED_FAILURE_MAX_CHARS - DETACHED_FAILURE_MESSAGE_RESERVE - metadataChars
+      - stderrSegments * DETACHED_FAILURE_SEPARATOR.length,
+  );
+  const stderrCap = stderrSegments > 0
+    ? Math.min(DETACHED_FAILURE_STDERR_MAX_CHARS, Math.floor(stderrBudget / stderrSegments))
+    : 0;
+  const parts: string[] = [];
+  for (const segment of segments) {
+    if (segment.stderr) {
+      const sanitized = sanitizeDetachedFailureText(segment.stderr);
+      parts.push(sanitized.length > stderrCap ? `${sanitized.slice(0, Math.max(0, stderrCap - 1))}…` : sanitized);
+    }
+    parts.push(...metadataOf(segment));
+  }
+
+  // Describe the error message chain
   const describe = (value: unknown, depth: number): string => {
     if (depth > 4) return "nested failure";
     if (value instanceof AggregateError) {
-      return [value.message, ...[...value.errors].map((child) => describe(child, depth + 1))]
-        .filter(Boolean)
-        .join(": ");
+      const errorParts = [value.message, ...[...value.errors].map((child) => describe(child, depth + 1))]
+        .filter(Boolean);
+      return errorParts.join(": ");
     }
-    if (value instanceof Error) return value.message;
+    if (value instanceof Error) return redactFailedCommandArgv(value.message);
     return String(value);
   };
-  return describe(error, 0).replace(/[\r\n\t]+/g, " ").slice(0, 1_024);
+  
+  const messagePart = describe(error, 0);
+  if (messagePart) {
+    parts.push(sanitizeDetachedFailureText(messagePart));
+  }
+  
+  // Join all parts and bound to 1024 characters
+  return parts.filter(Boolean).join(DETACHED_FAILURE_SEPARATOR).slice(0, DETACHED_FAILURE_MAX_CHARS);
 }
 
 export class DetachedLaunchSafetyError extends Error {

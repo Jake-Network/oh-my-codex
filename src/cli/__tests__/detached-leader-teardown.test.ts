@@ -255,6 +255,314 @@ describe('detached leader HUD teardown', () => {
     );
   });
 
+  it('includes bounded stderr summary at the beginning when error has stderr property', () => {
+    const error = Object.assign(new Error('setup failed'), {
+      stderr: 'command not found: node',
+      status: 127,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.match(result, /command not found: node/);
+    assert.match(result, /status=127/);
+    assert.match(result, /setup failed/);
+  });
+
+  it('truncates long stderr to 255 characters with ellipsis marker', () => {
+    const longStderr = 'x'.repeat(300);
+    const error = Object.assign(new Error('stderr test'), {
+      stderr: longStderr,
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.match(result, /^x{255}…/);
+  });
+
+  it('handles Buffer stderr by converting to string', () => {
+    const error = Object.assign(new Error('buffer stderr test'), {
+      stderr: Buffer.from('buffer stderr content'),
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.match(result, /buffer stderr content/);
+  });
+
+  it('redacts absolute paths from stderr and error messages', () => {
+    const error = Object.assign(new Error('failed at /home/user/project/src/file.ts'), {
+      stderr: 'error in /var/log/app.log',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /\/home\/user/);
+    assert.doesNotMatch(result, /\/var\/log/);
+    assert.match(result, /\[path\]/);
+  });
+
+  it('redacts secret patterns from stderr and error messages', () => {
+    const error = Object.assign(new Error('auth failed with sk-proj-abc12345def'), {
+      stderr: 'Bearer token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /sk-proj-abc12345def/);
+    assert.doesNotMatch(result, /eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9/);
+    assert.match(result, /\[redacted\]/);
+  });
+
+  it('handles stderr-only errors without message', () => {
+    const error = Object.assign(new Error(), {
+      stderr: 'connection refused',
+      status: 0,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.match(result, /connection refused/);
+    assert.match(result, /status=0/);
+    assert.ok(result.length <= 1024);
+  });
+
+  it('never includes captured subprocess stdout', () => {
+    const error = Object.assign(new Error('Command failed: tmux new-session'), {
+      status: 1,
+      stdout: 'UNRELATED_STDOUT_PAYLOAD',
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /UNRELATED_STDOUT_PAYLOAD/);
+    assert.match(result, /status=1/);
+  });
+
+  it('includes signal information when present', () => {
+    const error = Object.assign(new Error('terminated'), {
+      signal: 'SIGTERM',
+      stderr: 'cleanup failed',
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.match(result, /signal=SIGTERM/);
+    assert.match(result, /cleanup failed/);
+  });
+
+  it('includes code information when present', () => {
+    const error = Object.assign(new Error('io error'), {
+      code: 'ENOENT',
+      stderr: 'file not found',
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.match(result, /code=ENOENT/);
+    assert.match(result, /file not found/);
+  });
+
+  it('walks nested AggregateError causes and includes stderr from any level', () => {
+    const innerError = Object.assign(new Error('inner failure'), {
+      stderr: 'inner stderr content',
+    });
+    const aggregated = new AggregateError(
+      [innerError, new Error('other error')],
+      'aggregate failed',
+    );
+    const result = describeDetachedLeaderFailure(aggregated);
+    // Should include both the nested stderr and the error chain
+    assert.match(result, /inner stderr content/);
+    assert.match(result, /aggregate failed/);
+    assert.match(result, /inner failure/);
+  });
+
+  it('redacts the whole bearer credential including base64 punctuation', () => {
+    const error = Object.assign(new Error('auth failed'), {
+      stderr: 'Authorization: Bearer abc+SECRET/rest== denied',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /SECRET|rest==/);
+    assert.match(result, /\[redacted\] denied/);
+  });
+
+  it('redacts key-labelled credential values but keeps the label', () => {
+    const error = Object.assign(new Error('login failed password: hunter2'), {
+      stderr: 'bad config api_key=mysecretvalue123 OPENAI_API_KEY=sk_live_value client_secret: abc,def',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /mysecretvalue123|sk_live_value|hunter2|abc|def/);
+    assert.match(result, /api_key=\[redacted\]/);
+    assert.match(result, /OPENAI_API_KEY=\[redacted\]/);
+    assert.match(result, /client_secret: \[redacted\]/);
+    assert.match(result, /password: \[redacted\]/);
+  });
+
+  it('redacts quoted key-labelled credential values, including spaces and unterminated quotes', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: `password="hunter2 two" api_key='mysecretvalue123' token="unterminated rest`,
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /hunter2|two|mysecretvalue123|unterminated|rest/);
+    assert.match(result, /^password=\[redacted\] api_key=\[redacted\] token=\[redacted\] \| status=1/);
+  });
+
+  it('redacts credentials whose JSON keys are quoted', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: '{"password":"hunter2","api_key": "mysecretvalue123","user":"alice"}',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /hunter2|mysecretvalue123/);
+    assert.match(result, /^\{"password":\[redacted\],"api_key": \[redacted\],"user":"alice"\} \| status=1/);
+  });
+
+  it('redacts Basic, Digest and token authorization schemes', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: 'Authorization: Basic dXNlcjpwYXNz; proxy: Digest abc123secret; gh: token ghs0plainvalue',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /dXNlcjpwYXNz|abc123secret|ghs0plainvalue/);
+    assert.match(result, /^Authorization: \[redacted\] proxy: \[redacted\] gh: \[redacted\] \| status=1/);
+  });
+
+  it('redacts every field of a structured Digest header', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: 'Authorization: Digest username="Mufasa", nonce="abc", response="secret"\nnext line',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /Mufasa|nonce|secret/);
+    assert.match(result, /Authorization: \[redacted\]/);
+    assert.match(result, /next line/);
+  });
+
+  it('redacts quoted credential values containing escaped quotes', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: String.raw`{"password":"hunter2\"tail-secret","user":"alice"}`,
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /hunter2|tail-secret/);
+    assert.match(result, /"user":"alice"/);
+  });
+
+  it('redacts OpenAI-style keys containing underscores in full', () => {
+    const error = Object.assign(new Error('x'), { stderr: 'bad key sk-proj-abcdefgh_SECRETTAIL end', status: 1 });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /SECRETTAIL|abcdefgh/);
+    assert.match(result, /^bad key \[redacted\] end \| status=1/);
+  });
+
+  it('redacts single-component absolute paths without touching relative fractions', () => {
+    const error = Object.assign(new Error('x'), { stderr: 'cannot open /private-key or /root/ (N/A, 1/2)', status: 1 });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /private-key|\/root/);
+    assert.match(result, /^cannot open \[path\] or \[path\] \(N\/A, 1\/2\) \| status=1/);
+  });
+
+  it('redacts fine-grained GitHub access tokens', () => {
+    const error = Object.assign(new Error('push failed'), {
+      stderr: 'auth github_pat_11AAAAAAA0abcdefGHIJKL_mnopqrstuvWXYZ0123456789 rejected',
+      status: 128,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /github_pat_|mnopqrstuv/);
+    assert.match(result, /^auth \[redacted\] rejected \| status=128/);
+  });
+
+  it('keeps exit metadata from a failure wrapped in an AggregateError', () => {
+    const child = Object.assign(new Error('release failed'), { stderr: 'failed', status: 23, signal: 'SIGKILL' });
+    const result = describeDetachedLeaderFailure(new AggregateError([child], 'detached abort failed'));
+    assert.match(result, /^failed \| status=23 \| signal=SIGKILL \| detached abort failed: release failed$/);
+  });
+
+  it('keeps each nested failure\'s exit metadata attributed to its own stderr', () => {
+    const first = Object.assign(new Error('kill-pane failed'), { stderr: 'no pane', status: 1 });
+    const second = Object.assign(new Error('rm failed'), { stderr: 'busy', signal: 'SIGKILL', code: 'EBUSY' });
+    const result = describeDetachedLeaderFailure(new AggregateError([first, second], 'cleanup failed'));
+    assert.equal(
+      result,
+      'no pane | status=1 | busy | signal=SIGKILL | code=EBUSY | cleanup failed: kill-pane failed: rm failed',
+    );
+  });
+
+  it('includes the cause of an AggregateError alongside its errors', () => {
+    const cause = Object.assign(new Error('spawn failed'), { stderr: 'tmux socket missing', status: 2 });
+    const child = Object.assign(new Error('kill-pane failed'), { stderr: 'no pane', status: 1 });
+    const result = describeDetachedLeaderFailure(new AggregateError([child], 'cleanup failed', { cause }));
+    assert.match(result, /^no pane \| status=1 \| tmux socket missing \| status=2 \| cleanup failed/);
+  });
+
+  it('drops non-symbolic signal and code values instead of echoing them', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: 'boom',
+      status: 1,
+      signal: '\u001b]52;c;Y2xpcA==\u0007',
+      code: 'ghp_abcdefghijklmnop /home/user/secret',
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.equal(result, 'boom | status=1 | x');
+  });
+
+  it('drops uppercase non-identifier signal and code values such as access key ids', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: 'boom',
+      status: 1,
+      signal: 'AKIAIOSFODNN7EXAMPLE',
+      code: 'AKIAIOSFODNN7EXAMPLE',
+    });
+    assert.equal(describeDetachedLeaderFailure(error), 'boom | status=1 | x');
+    const known = Object.assign(new Error('y'), { signal: 'SIGKILL', code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+    assert.equal(describeDetachedLeaderFailure(known), 'signal=SIGKILL | code=ERR_CHILD_PROCESS_STDIO_MAXBUFFER | y');
+  });
+
+  it('reserves space for exit metadata when many long stderrs are aggregated', () => {
+    const children = [1, 2, 3, 4, 5].map((n) =>
+      Object.assign(new Error(`step ${n} failed`), { stderr: String(n).repeat(400), status: 10 + n }));
+    const result = describeDetachedLeaderFailure(new AggregateError(children, 'cleanup failed'));
+    assert.ok(result.length <= 1024, `${result.length}`);
+    for (const n of [1, 2, 3, 4, 5]) assert.match(result, new RegExp(`\\| status=${10 + n}(?: |$)`));
+    assert.match(result, /cleanup failed: step 1 failed/);
+  });
+
+  it('keeps every exit metadata field when fourteen long cleanup failures are aggregated', () => {
+    const children = Array.from({ length: 14 }, (_, n) =>
+      Object.assign(new Error(`cleanup step ${n} failed`), {
+        stderr: 'x'.repeat(400),
+        status: 100 + n,
+        signal: 'SIGTERM',
+        code: 'ECONNREFUSED',
+      }));
+    const result = describeDetachedLeaderFailure(new AggregateError(children, 'post-launch cleanup failed'));
+    assert.ok(result.length <= 1024, `${result.length}`);
+    for (let n = 0; n < 14; n += 1) {
+      assert.match(result, new RegExp(`status=${100 + n} \\| signal=SIGTERM \\| code=ECONNREFUSED`));
+    }
+    assert.match(result, /post-launch cleanup failed/);
+  });
+
+  it('never echoes failed-command argv, even values split by unquoted whitespace', () => {
+    const error = Object.assign(
+      new Error('Command failed: tmux new-session -d -e OMX_TEAM_WORKER_LAUNCH_ARGS=alpha beta-secret -e OMX_SESSION_ID=omx-1\nboom'),
+      { stderr: 'boom', status: 1 },
+    );
+    const result = describeDetachedLeaderFailure(error);
+    assert.equal(result, 'boom | status=1 | Command failed: tmux new-session [argv redacted]');
+  });
+
+  it('strips terminal escape sequences and control bytes from stderr', () => {
+    const error = Object.assign(new Error('x'), {
+      stderr: '\u001b[31mred\u001b[0m \u001b]52;c;Y2xpcA==\u0007tail\u0007\u009b',
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.doesNotMatch(result, /[\u0000-\u001f\u007f-\u009f]/);
+    assert.doesNotMatch(result, /Y2xpcA/);
+    assert.match(result, /^red tail \| status=1/);
+  });
+
+  it('bounds total output to 1024 characters', () => {
+    const longMessage = 'y'.repeat(600);
+    const longStderr = 'z'.repeat(600);
+    const error = Object.assign(new Error(longMessage), {
+      stderr: longStderr,
+      status: 1,
+    });
+    const result = describeDetachedLeaderFailure(error);
+    assert.ok(result.length <= 1024, `Expected <= 1024 chars, got ${result.length}`);
+  });
+
   it('derives the detached leader pane from the live pane PID instead of inherited TMUX_PANE', () => {
     const snapshot = [
       '%1\t0\t111',
