@@ -44,6 +44,7 @@ import {
 	establishLaunchSessionBinding,
 	finalizeBoundOnce,
 	updateDetachedSessionMetadata,
+	writeNativeSessionOwner,
 	writeSessionStart,
 } from "../../hooks/session.js";
 import { neutralizeOwnedRoutingRalplan } from '../../ralplan/documented-leader-preflight.js';
@@ -67,6 +68,11 @@ import {
 import { getBaseStateDir } from "../../state/paths.js";
 import { maybeNudgeLeaderForAllowedWorkerStop } from "../notify-hook/team-worker-stop.js";
 import { MAX_NATIVE_STDIN_JSON_BYTES } from "../hook-payload-guard.js";
+import {
+	injectExecFollowup,
+	markExecFollowupsDelivered,
+	readPendingExecFollowups,
+} from "../../exec/followup.js";
 
 
 const ARGUMENT_PRODUCING_RUNTIME_DENIAL_COMMANDS = [
@@ -2662,6 +2668,250 @@ describe("codex native hook dispatch", { concurrency: false }, () => {
 				await readFile(auditPath, "utf-8"),
 				/exec_followup_queue_corrupt_recovered/,
 			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("session-scoped Stop with queued exec follow-up for active ralplan delivers it once and marks consumed", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-stop-scoped-exec-followup-"));
+		try {
+			const nativeSessionId = "codex-root-scoped-exec-followup";
+			const activeSessionId = "omx-active-other";
+			const stateDir = join(cwd, ".omx", "state");
+
+			// Create native session owner
+			const nativeState = await writeNativeSessionOwner(cwd, nativeSessionId, {
+				pid: process.pid,
+			});
+
+			// Set native session as active FIRST so injectExecFollowup can find it
+			await writeJson(join(stateDir, "session.json"), { session_id: nativeSessionId });
+
+			// Write an active ralplan skill state for this native session
+			await writeJson(
+				join(stateDir, "sessions", nativeSessionId, "skill-active-state.json"),
+				{
+					version: 1,
+					active: true,
+					skill: "ralplan",
+					phase: "planning",
+					session_id: nativeSessionId,
+				},
+			);
+
+			await writeJson(
+				join(stateDir, "sessions", nativeSessionId, "ralplan-state.json"),
+				{
+					active: true,
+					mode: "ralplan",
+					current_phase: "planning",
+					session_id: nativeSessionId,
+				},
+			);
+
+			// Inject a queued exec follow-up for this native session (while it's active)
+			const queued = await injectExecFollowup({
+				cwd,
+				sessionId: nativeSessionId,
+				actor: "test",
+				prompt: "Verify the exec follow-up implementation.",
+				nowIso: "2026-09-30T12:00:00.000Z",
+			});
+
+			// Change active session so resolveInternalSessionIdForPayload fails for native session ID
+			// This triggers the ownerState logic in dispatchCodexNativeHook's Stop handler
+			await mkdir(join(stateDir, "sessions", activeSessionId), { recursive: true });
+			await writeJson(join(stateDir, "session.json"), { session_id: activeSessionId });
+
+			// Dispatch Stop with native session ID (triggers sessionScopedOnly via ownerState)
+			const stopResult = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: nativeSessionId,
+				},
+				{ cwd },
+			);
+
+			// The output should deliver the queued exec follow-up
+			assert.equal(stopResult.outputJson?.decision, "block");
+			assert.match(
+				String(stopResult.outputJson?.reason),
+				new RegExp(queued.queued.id),
+			);
+
+			// Verify that the follow-up is marked as delivered
+			const after = await readPendingExecFollowups(cwd, nativeSessionId);
+			assert.equal(after.pending.length, 0);
+			const persisted = JSON.parse(await readFile(queued.queuePath, "utf-8")) as {
+				records: Array<{ delivered_at?: string; delivery_event?: string }>;
+			};
+			assert.equal(persisted.records[0]?.delivery_event, "stop-hook");
+			assert.ok(persisted.records[0]?.delivered_at);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("session-scoped second Stop does not redeliver consumed exec follow-up", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-stop-scoped-no-redeliver-"));
+		try {
+			const nativeSessionId = "codex-root-scoped-no-redeliver";
+			const activeSessionId = "omx-active-other-2";
+			const stateDir = join(cwd, ".omx", "state");
+
+			// Create native session owner
+			const nativeState = await writeNativeSessionOwner(cwd, nativeSessionId, {
+				pid: process.pid,
+			});
+
+			// Set native session as active FIRST so injectExecFollowup can find it
+			await writeJson(join(stateDir, "session.json"), { session_id: nativeSessionId });
+
+			// Write an active ralplan skill state
+			await writeJson(
+				join(stateDir, "sessions", nativeSessionId, "skill-active-state.json"),
+				{
+					version: 1,
+					active: true,
+					skill: "ralplan",
+					phase: "planning",
+					session_id: nativeSessionId,
+				},
+			);
+
+			await writeJson(
+				join(stateDir, "sessions", nativeSessionId, "ralplan-state.json"),
+				{
+					active: true,
+					mode: "ralplan",
+					current_phase: "planning",
+					session_id: nativeSessionId,
+				},
+			);
+
+			// Inject a queued exec follow-up (while native session is active)
+			const queued = await injectExecFollowup({
+				cwd,
+				sessionId: nativeSessionId,
+				actor: "test",
+				prompt: "First exec follow-up.",
+				nowIso: "2026-09-30T12:00:00.000Z",
+			});
+
+			// Change active session so resolveInternalSessionIdForPayload fails for native session ID
+			await mkdir(join(stateDir, "sessions", activeSessionId), { recursive: true });
+			await writeJson(join(stateDir, "session.json"), { session_id: activeSessionId });
+
+			// First Stop dispatches and delivers the follow-up
+			const firstStop = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: nativeSessionId,
+				},
+				{ cwd },
+			);
+			assert.equal(firstStop.outputJson?.decision, "block");
+			assert.match(
+				String(firstStop.outputJson?.reason),
+				new RegExp(queued.queued.id),
+			);
+
+			// Verify follow-up is now consumed
+			const afterFirst = await readPendingExecFollowups(cwd, nativeSessionId);
+			assert.equal(afterFirst.pending.length, 0);
+
+			// Second Stop should not deliver it again (already consumed)
+			const secondStop = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: nativeSessionId,
+				},
+				{ cwd },
+			);
+			// Second stop should block on the skill, not on exec follow-up
+			assert.match(
+				String(secondStop.outputJson?.reason ?? ""),
+				/ralplan is still active/,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+
+	it("non-scoped Stop with exec follow-up for foreign session does not deliver", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-stop-foreign-exec-"));
+		try {
+			// Create one native session with exec follow-up
+			const nativeSessionId1 = "codex-root-foreign-1";
+			const activeSessionId = "omx-active-other-3";
+			const stateDir = join(cwd, ".omx", "state");
+
+			const nativeState1 = await writeNativeSessionOwner(cwd, nativeSessionId1, {
+				pid: process.pid,
+			});
+
+			// Set native session as active FIRST so injectExecFollowup can find it
+			await writeJson(join(stateDir, "session.json"), { session_id: nativeSessionId1 });
+
+			await writeJson(
+				join(stateDir, "sessions", nativeSessionId1, "skill-active-state.json"),
+				{
+					version: 1,
+					active: true,
+					skill: "ralplan",
+					phase: "planning",
+					session_id: nativeSessionId1,
+				},
+			);
+
+			await writeJson(
+				join(stateDir, "sessions", nativeSessionId1, "ralplan-state.json"),
+				{
+					active: true,
+					mode: "ralplan",
+					current_phase: "planning",
+					session_id: nativeSessionId1,
+				},
+			);
+
+			// Inject exec follow-up for session1 (while it's active)
+			const queued = await injectExecFollowup({
+				cwd,
+				sessionId: nativeSessionId1,
+				actor: "test",
+				prompt: "Follow-up for session 1.",
+				nowIso: "2026-09-30T12:00:00.000Z",
+			});
+
+			// Change active session so resolveInternalSessionIdForPayload fails for native session ID
+			await mkdir(join(stateDir, "sessions", activeSessionId), { recursive: true });
+			await writeJson(join(stateDir, "session.json"), { session_id: activeSessionId });
+
+			// Try to stop a different foreign session (not scoped, no owner)
+			const foreignNativeSessionId = "codex-root-foreign-2";
+			const stopResult = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: foreignNativeSessionId,
+				},
+				{ cwd },
+			);
+
+			// Stop for foreign session should not deliver the follow-up from session1
+			assert.equal(stopResult.omxEventName, "stop");
+			assert.ok(
+				!String(stopResult.outputJson?.reason ?? "").includes(queued.queued.id),
+			);
+
+			// Follow-up should still be pending for session1
+			const stillPending = await readPendingExecFollowups(cwd, nativeSessionId1);
+			assert.equal(stillPending.pending.length, 1);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
@@ -10886,30 +11136,27 @@ case "$1" in
       printf '%%1 0 200\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9 0 201\n'
     elif [[ "$*" == *'pane_current_command'* ]]; then
-      printf '%%1\t/bin/codex\t0\t0\t80\t58\t57\t80\t61\t/bin/codex\t/tmp\t0\t200\n'
-      if [[ "$*" != *'-t %1'* && "$panes" == *'%9'* ]]; then
-        printf '%%9\tnode\t0\t59\t80\t2\t60\t80\t61\tenv OMX_SESSION_ID=sess-hud-1 OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\t/tmp\t0\t201\n'
-      fi
+      printf '%%1\x1f/bin/codex\x1f0\x1f0\x1f80\x1f58\x1f57\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f200\x1f/bin/codex\x1f/tmp\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9\x1fnode\x1f0\x1f59\x1f80\x1f2\x1f60\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f201\x1fenv OMX_SESSION_ID=sess-hud-1 OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\x1f/tmp\n'
+    elif [[ "$*" == *'#{pane_id}|#{pane_start_command}'* ]]; then
+      printf '%%1|/bin/codex\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9|OMX_TMUX_SPLIT_OPERATION_MARKER=%s; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n' "'$marker'"
     elif [[ "$*" == *'pane_start_command'* ]]; then
       printf '%%1\t/bin/codex\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
     elif [[ "$panes" == *'%9'* ]]; then
-      if [[ "$*" == *'-t %1'* ]]; then
-        printf '%%1\n'
-      else
-        printf '%%1\n%%9\n'
-      fi
+      printf '%%1\n%%9\n'
     else
       printf '%%1\n'
     fi
     ;;
   display-message)
     if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
-      printf '%%1\t0\t200\t$1\t@1\n'
+      printf '%%1|0|200|$1|@1\n'
     elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
-      printf '$1\t@1\n'
+      printf '$1|@1\n'
     else
-      printf '200\t60\n'
+      printf '200|60\n'
     fi
     ;;
   set-option)
@@ -10942,6 +11189,7 @@ printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
   resize-pane)
     ;;
 esac
+exit 0
 `
 			);
 			await chmod(join(binDir, "tmux"), 0o755);
@@ -11087,18 +11335,22 @@ case "$1" in
       printf '%%1 0 200\n%%2 0 201\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9 0 202\n'
     elif [[ "$*" == *'pane_current_command'* ]]; then
-      printf '%%1\t/bin/codex\t0\t0\t80\t58\t57\t80\t61\t/bin/codex\t/tmp\t0\t200\n'
+      printf '%%1\x1f/bin/codex\x1f0\x1f0\x1f80\x1f58\x1f57\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f200\x1f/bin/codex\x1f/tmp\n'
       if [[ "$*" != *'-t %1'* ]]; then
-        printf '%%2\tnode\t0\t59\t80\t2\t60\t80\t61\tenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\t/tmp\t0\t201\n'
-        [[ "$panes" == *'%9'* ]] && printf '%%9\tnode\t0\t59\t80\t2\t60\t80\t61\tenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\t/tmp\t0\t202\n'
+        printf '%%2\x1fnode\x1f0\x1f59\x1f80\x1f2\x1f60\x1f80\x1f61\x1f$1\x1f@2\x1f0\x1f201\x1fenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\x1f/tmp\n'
       fi
+      [[ "$panes" == *'%9'* ]] && printf '%%9\x1fnode\x1f0\x1f59\x1f80\x1f2\x1f60\x1f80\x1f61\x1f$1\x1f@1\x1f0\x1f202\x1fenv OMX_SESSION_ID=omx-canonical-hud-reuse OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\x1f/tmp\n'
+    elif [[ "$*" == *'#{pane_id}|#{pane_start_command}'* ]]; then
+      printf '%%1|/bin/codex\n'
+      printf '%%2|exec env OMX_TMUX_HUD_OWNER=1 ${OMX_TMUX_HUD_LEADER_PANE_ENV}=%%1 /node /omx.js hud --watch\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9|OMX_TMUX_SPLIT_OPERATION_MARKER=%s; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n' "'$marker'"
     elif [[ "$*" == *'pane_start_command'* ]]; then
       printf '%%1\t/bin/codex\n'
       printf '%%2\texec env OMX_TMUX_HUD_OWNER='"'"'"1'"'"' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='"'"'"%%1'"'"' /node /omx.js hud --watch\n'
       [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
     elif [[ "$panes" == *'%9'* ]]; then
       if [[ "$*" == *'-t %1'* ]]; then
-        printf '%%1\n'
+        printf '%%1\n%%9\n'
       else
         printf '%%1\n%%2\n%%9\n'
       fi
@@ -11112,11 +11364,11 @@ case "$1" in
     ;;
   display-message)
     if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
-      printf '%%1\t0\t200\t$1\t@1\n'
+      printf '%%1|0|200|$1|@1\n'
     elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
-      printf '$1\t@1\n'
+      printf '$1|@1\n'
     else
-      printf '200\t60\n'
+      printf '200|60\n'
     fi
     ;;
   set-option)
@@ -11149,6 +11401,7 @@ printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
   resize-pane)
     ;;
 esac
+exit 0
 `
 			);
 			await chmod(join(binDir, "tmux"), 0o755);

@@ -750,6 +750,67 @@ describe('launchQuestionRenderer', () => {
     assert.deepEqual(calls, [['display-message', '-p', '-t', '%11', '#{session_attached}']]);
   });
 
+  it('reports tmux permission failures without claiming the session is detached', () => {
+    const probeError = Object.assign(
+      new Error('connect /private/tmp/tmux-501/default: Operation not permitted'),
+      { code: 'EPERM' },
+    );
+
+    assert.throws(
+      () => launchQuestionRenderer(
+        {
+          cwd: '/repo',
+          recordPath: '/repo/.omx/state/sessions/s1/questions/question-permission-denied.json',
+          sessionId: 's1',
+          env: { TMUX: '/private/tmp/tmux-501/default,3190,44', TMUX_PANE: '%11' } as NodeJS.ProcessEnv,
+        },
+        {
+          strategy: 'inside-tmux',
+          execTmux: () => { throw probeError; },
+          sleepSync: () => {},
+        },
+      ),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { code?: string }).code, 'question_tmux_access_denied');
+        assert.equal(error.cause, probeError);
+        assert.match(error.message, /attachment probe/i);
+        assert.match(error.message, /access.*denied|permission/i);
+        assert.doesNotMatch(error.message, /no attached client/i);
+        return true;
+      },
+    );
+  });
+
+  it('preserves unexpected tmux attachment probe failures', () => {
+    const probeError = new Error('tmux server returned malformed output');
+
+    assert.throws(
+      () => launchQuestionRenderer(
+        {
+          cwd: '/repo',
+          recordPath: '/repo/.omx/state/sessions/s1/questions/question-probe-failed.json',
+          sessionId: 's1',
+          env: { TMUX: '/tmp/tmux-demo', TMUX_PANE: '%11' } as NodeJS.ProcessEnv,
+        },
+        {
+          strategy: 'inside-tmux',
+          execTmux: () => { throw probeError; },
+          sleepSync: () => {},
+        },
+      ),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.equal((error as Error & { code?: string }).code, 'question_tmux_probe_failed');
+        assert.equal(error.cause, probeError);
+        assert.match(error.message, /tmux attachment probe failed/i);
+        assert.match(error.message, /malformed output/i);
+        assert.doesNotMatch(error.message, /no attached client/i);
+        return true;
+      },
+    );
+  });
+
   it('targets an explicit host pane when launching from a container without TMUX', () => {
     const calls: string[][] = [];
     const result = launchQuestionRenderer(

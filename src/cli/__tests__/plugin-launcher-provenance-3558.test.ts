@@ -533,6 +533,11 @@ describe("issue 3558 launcher provenance", () => {
             { recursive: true },
           );
           await cp(
+            join(packageRoot, "plugins", "oh-my-codex", "templates"),
+            join(cacheDir, "templates"),
+            { recursive: true },
+          );
+          await cp(
             join(packageRoot, "plugins", "oh-my-codex", ".mcp.json"),
             join(cacheDir, ".mcp.json"),
           );

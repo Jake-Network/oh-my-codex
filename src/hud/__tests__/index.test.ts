@@ -90,6 +90,85 @@ describe('hudCommand reconcile entrypoint', () => {
 });
 
 describe('runWatchMode', () => {
+  it('keeps a verified owned HUD idle for sixty watcher ticks without reconciliation', async () => {
+    let tick: (() => void) | undefined;
+    let stop: (() => void) | undefined;
+    let repairs = 0;
+    let hookWrites = 0;
+    let frames = 0;
+    const panes = [
+      { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', panePid: '101', sessionId: '$1', windowId: '@1',
+        paneLeft: 0, paneTop: 0, paneWidth: 80, paneHeight: 20, paneBottom: 19, windowWidth: 80, windowHeight: 23 },
+      { paneId: '%2', currentCommand: 'node', panePid: '102', sessionId: '$1', windowId: '@1',
+        startCommand: "OMX_TMUX_HUD_OWNER='1' OMX_SESSION_ID='idle-test' OMX_TMUX_HUD_LEADER_PANE='%1' node omx hud --watch",
+        paneLeft: 0, paneTop: 21, paneWidth: 80, paneHeight: 2, paneBottom: 22, windowWidth: 80, windowHeight: 23 },
+    ];
+    const promise = runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: { TMUX: 'tmux', TMUX_PANE: '%2', OMX_SESSION_ID: 'idle-test',
+        [OMX_TMUX_HUD_OWNER_ENV]: '1', [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%1' },
+      isOwnerAliveFn: async () => true,
+      isSessionAttachedFn: () => true,
+      listCurrentWindowPanesFn: () => panes,
+      readHudLeaderOwnerFn: () => 'current',
+      readHudHookHealthFn: () => 'healthy',
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+      readAllStateFn: async () => emptyCtx(),
+      renderHudFn: () => { frames += 1; return 'frame'; },
+      reconcileTmuxHudFn: async () => { repairs += 1; },
+      registerHudResizeHookFn: () => { hookWrites += 1; return true; },
+      runAuthorityTickFn: async () => {},
+      writeStdout: () => {}, writeStderr: () => {},
+      registerSigint: handler => { stop = handler; },
+      setIntervalFn: handler => { tick = handler; return {} as ReturnType<typeof setInterval>; },
+      clearIntervalFn: () => {},
+    });
+    await flush();
+    for (let index = 0; index < 60; index += 1) {
+      tick?.();
+      await flush();
+    }
+    stop?.();
+    await promise;
+    assert.equal(frames, 61);
+    assert.equal(repairs, 0);
+    assert.equal(hookWrites, 0);
+  });
+
+  it('does not overlap watcher repair children while rendering continues', async () => {
+    let tick: (() => void) | undefined;
+    let stop: (() => void) | undefined;
+    let repairs = 0;
+    let frames = 0;
+    const child = deferred();
+    const promise = runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: { TMUX: 'tmux', TMUX_PANE: '%2', OMX_SESSION_ID: 'repair-test',
+        [OMX_TMUX_HUD_OWNER_ENV]: '1', [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%1' },
+      isOwnerAliveFn: async () => true,
+      isSessionAttachedFn: () => true,
+      listCurrentWindowPanesFn: () => [{ paneId: '%1', currentCommand: 'codex', startCommand: 'codex', panePid: '101',
+        paneLeft: 0, paneTop: 0, paneWidth: 80, paneHeight: 22, paneBottom: 21, windowWidth: 80, windowHeight: 23 }],
+      readHudLeaderOwnerFn: () => 'current',
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+      readAllStateFn: async () => emptyCtx(),
+      renderHudFn: () => { frames += 1; return 'frame'; },
+      reconcileTmuxHudFn: async () => { repairs += 1; await child.promise; },
+      runAuthorityTickFn: async () => {},
+      writeStdout: () => {}, writeStderr: () => {},
+      registerSigint: handler => { stop = handler; },
+      setIntervalFn: handler => { tick = handler; return {} as ReturnType<typeof setInterval>; },
+      clearIntervalFn: () => {},
+    });
+    await flush();
+    for (let index = 0; index < 3; index += 1) { tick?.(); await flush(); }
+    assert.equal(repairs, 1);
+    assert.equal(frames, 4);
+    child.resolve();
+    stop?.();
+    await promise;
+  });
+
   it('resolves a live cwd when the HUD launch path was reused by another run', () => {
     const resolved = resolveHudWatchCwd('/home/tools/calc', {
       getCwd: () => '/home/tools/calc',
@@ -394,12 +473,19 @@ describe('runWatchMode', () => {
     const workers = Array.from({ length: 15 }, (_, i) => ({ name: `worker-${i + 1}`, state: 'working' as const }));
     const promise = runWatchMode('/tmp', WATCH_FLAGS, {
       isTTY: true,
-      env: { TMUX: 'tmux', TMUX_PANE: '%hud', [OMX_TMUX_HUD_OWNER_ENV]: '1', [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%leader' },
+      env: { TMUX: 'tmux', TMUX_PANE: '%2', OMX_SESSION_ID: 'watch-test', [OMX_TMUX_HUD_OWNER_ENV]: '1', [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%1' },
       listCurrentWindowPanesFn: () => [
-        { paneId: '%leader', currentCommand: 'codex', startCommand: 'codex', paneHeight: frame === 1 ? 14 : 50, windowHeight: frame === 1 ? 24 : 70 },
-        { paneId: '%hud', currentCommand: 'node', startCommand: 'hud', paneHeight: frame === 1 ? 9 : 19 },
+        { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', panePid: '101', sessionId: '$1', windowId: '@1',
+          paneLeft: 0, paneTop: 0, paneWidth: 80, paneHeight: frame === 1 ? 14 : 50,
+          paneBottom: frame === 1 ? 13 : 49, windowWidth: 80, windowHeight: frame === 1 ? 24 : 70 },
+        { paneId: '%2', currentCommand: 'node', panePid: '102', sessionId: '$1', windowId: '@1',
+          startCommand: "OMX_TMUX_HUD_OWNER='1' OMX_SESSION_ID='watch-test' OMX_TMUX_HUD_LEADER_PANE='%1' node omx hud --watch",
+          paneLeft: 0, paneTop: frame === 1 ? 15 : 51, paneWidth: 80, paneHeight: frame === 1 ? 9 : 19,
+          paneBottom: frame === 1 ? 23 : 69, windowWidth: 80, windowHeight: frame === 1 ? 24 : 70 },
       ],
       isSessionAttachedFn: () => true,
+      isOwnerAliveFn: async () => true,
+      readHudLeaderOwnerFn: () => 'current',
       readAllStateFn: async () => ({ ...emptyCtx(), team: frame === 3 ? null : {
         active: true, team_name: 'checkout', workers: workers.map(worker => ({ ...worker, state: frame === 0 ? 'working' : 'done' })),
       } }),
@@ -413,6 +499,7 @@ describe('runWatchMode', () => {
       resizeTmuxPaneFn: (_pane, height) => { heights.push(height); return true; },
       clearTmuxPaneHistoryFn: () => true,
       registerHudResizeHookFn: () => true,
+      readHudHookHealthFn: () => 'healthy',
       reconcileTmuxHudFn: async () => {},
       runAuthorityTickFn: async () => {},
     });
@@ -504,10 +591,21 @@ describe('runWatchMode', () => {
       isTTY: true,
       env: {
         TMUX: '1',
-        TMUX_PANE: '%hud',
+        TMUX_PANE: '%2',
+        OMX_SESSION_ID: 'watch-test',
         [OMX_TMUX_HUD_OWNER_ENV]: '1',
-        [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%leader',
+        [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%1',
       },
+      listCurrentWindowPanesFn: () => [
+        { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', panePid: '101', sessionId: '$1', windowId: '@1',
+          paneLeft: 0, paneTop: 0, paneWidth: 80, paneHeight: 20, paneBottom: 19, windowWidth: 80, windowHeight: 24 },
+        { paneId: '%2', currentCommand: 'node', panePid: '102', sessionId: '$1', windowId: '@1',
+          startCommand: "OMX_TMUX_HUD_OWNER='1' OMX_SESSION_ID='watch-test' OMX_TMUX_HUD_LEADER_PANE='%1' node omx hud --watch",
+          paneLeft: 0, paneTop: 21, paneWidth: 80, paneHeight: callCount === 1 ? 3 : 2,
+          paneBottom: callCount === 1 ? 23 : 22, windowWidth: 80, windowHeight: 24 },
+      ],
+      readHudHookHealthFn: () => 'healthy',
+      readHudLeaderOwnerFn: () => 'current',
       readAllStateFn: async () => {
         callCount += 1;
         if (callCount === 2) secondReadStarted.resolve();
@@ -561,19 +659,19 @@ describe('runWatchMode', () => {
     await promise;
 
     assert.deepEqual(resized, [
-      { paneId: '%hud', heightLines: 2 },
-      { paneId: '%hud', heightLines: 3 },
+      { paneId: '%2', heightLines: 2 },
+      { paneId: '%2', heightLines: 3 },
     ]);
     assert.deepEqual(registered, [
-      { hudPaneId: '%hud', leaderPaneId: '%leader', heightLines: 2 },
-      { hudPaneId: '%hud', leaderPaneId: '%leader', heightLines: 3 },
+      { hudPaneId: '%2', leaderPaneId: '%1', heightLines: 2 },
+      { hudPaneId: '%2', leaderPaneId: '%1', heightLines: 3 },
     ]);
     const secondClear = events.findIndex((event, index) => index > 0 && event === 'write:\u001b[3J\u001b[2J\u001b[H');
     const secondResize = events.indexOf('resize:3');
     const secondFrame = events.findIndex((event, index) => index > secondResize && event.includes('frame'));
     assert.ok(secondClear >= 0 && secondClear < secondResize, 'the new frame must clear before pane reflow');
     assert.ok(secondFrame > secondResize, 'the new frame must publish after pane reflow');
-    const secondHistory = events.findIndex((event, index) => index > secondResize && event === 'history:%hud');
+    const secondHistory = events.findIndex((event, index) => index > secondResize && event === 'history:%2');
     assert.ok(secondHistory > secondResize, 'reflowed HUD history must be cleared before frame publication');
   });
 
@@ -811,7 +909,7 @@ exit 0
       assert.match(tmuxLog, /list-panes -t %1 -F #\{pane_id\}/);
       assert.match(
         tmuxLog,
-        /list-panes -t %1 -F #\{pane_id\}\x1f#\{pane_current_command\}\x1f#\{pane_left\}\x1f#\{pane_top\}\x1f#\{pane_width\}\x1f#\{pane_height\}\x1f#\{pane_bottom\}\x1f#\{window_width\}\x1f#\{window_height\}\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}\x1f#\{pane_dead\}\x1f#\{pane_pid\}/,
+        /list-panes -t %1 -F #\{pane_id\}\x1f#\{pane_current_command\}\x1f#\{pane_left\}\x1f#\{pane_top\}\x1f#\{pane_width\}\x1f#\{pane_height\}\x1f#\{pane_bottom\}\x1f#\{window_width\}\x1f#\{window_height\}\x1f#\{session_id\}\x1f#\{window_id\}\x1f#\{pane_dead\}\x1f#\{pane_pid\}\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}/,
       );
       assert.doesNotMatch(tmuxLog, /kill-pane -t %3/);
       assert.doesNotMatch(tmuxLog, /resize-pane -t %2/);
@@ -884,7 +982,7 @@ exit 0
       assert.match(tmuxLog, /list-panes -t %1 -F #\{pane_id\}/);
       assert.match(
         tmuxLog,
-        /list-panes -t %1 -F #\{pane_id\}\x1f#\{pane_current_command\}\x1f#\{pane_left\}\x1f#\{pane_top\}\x1f#\{pane_width\}\x1f#\{pane_height\}\x1f#\{pane_bottom\}\x1f#\{window_width\}\x1f#\{window_height\}\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}\x1f#\{pane_dead\}\x1f#\{pane_pid\}/,
+        /list-panes -t %1 -F #\{pane_id\}\x1f#\{pane_current_command\}\x1f#\{pane_left\}\x1f#\{pane_top\}\x1f#\{pane_width\}\x1f#\{pane_height\}\x1f#\{pane_bottom\}\x1f#\{window_width\}\x1f#\{window_height\}\x1f#\{session_id\}\x1f#\{window_id\}\x1f#\{pane_dead\}\x1f#\{pane_pid\}\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}/,
       );
       assert.doesNotMatch(tmuxLog, /resize-pane -t %2/);
       assert.match(tmuxLog, /split-window -v -l 2 -t %1/);

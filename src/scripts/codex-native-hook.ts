@@ -21466,6 +21466,8 @@ async function buildStopHookOutput(
   const suppressParentWorkflowStop = shouldSuppressParentWorkflowStopForSideConversation(payload);
   if (options.sessionScopedOnly) {
     if (!canonicalSessionId || suppressParentWorkflowStop) return null;
+    const execFollowupOutput = await buildExecFollowupStopOutput(cwd, canonicalSessionId);
+    if (execFollowupOutput) return execFollowupOutput;
     for (const mode of ["autopilot", "ultrawork", "ultraqa"] as const) {
       const modeOutput = await buildModeBasedStopOutput(
         mode,
@@ -21904,7 +21906,10 @@ export async function dispatchCodexNativeHook(
   const sessionStartTranscriptPath = hookEventName === "SessionStart"
     ? safeString(payload.transcript_path ?? payload.transcriptPath).trim()
     : "";
-  const threadId = safeString(payload.thread_id ?? payload.threadId).trim();
+  // For native Codex events, thread_id may not exist as an explicit field; instead, session_id carries
+  // the thread identifier. When no explicit thread_id exists, fallback to session_id for identity resolution.
+  const explicitThreadId = readPayloadThreadId(payload);
+  const threadId = explicitThreadId || safeString(payload.session_id ?? payload.sessionId).trim();
   const turnId = safeString(payload.turn_id ?? payload.turnId).trim();
   const pointer = await readSessionPointer(pointerContext);
   const currentSessionState = pointer.status === "usable" ? pointer.state ?? null : null;

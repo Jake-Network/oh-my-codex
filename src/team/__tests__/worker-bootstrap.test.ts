@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm, mkdir } from "fs/promises";
 import { join } from "path";
+import { existsSync } from "fs";
 import { tmpdir } from "os";
 import {
   generateWorkerOverlay,
@@ -1110,6 +1111,16 @@ describe("worker bootstrap", () => {
     assert.ok(message.length < 200);
   });
 
+  it("leader mailbox notices handle a team removed before the queued notice is read", () => {
+    for (const root of [".omx/state", "$OMX_TEAM_STATE_ROOT", "/tmp/omx-run/.omx/state"]) {
+      const directive = buildLeaderMailboxTriggerDirective("finished-team", "worker-3", root);
+      assert.equal(directive.intent, "pending-mailbox-review");
+      assert.match(directive.text, /Team gone: ignore stale notice; don't ask user or restart/);
+      assert.match(directive.text, /Otherwise review; decide next step/);
+      assert.ok(directive.text.includes(`${root}/team/finished-team/mailbox/leader-fixed.json`));
+    }
+  });
+
   it("generateLeaderMailboxTriggerMessage tells the leader to read the mailbox and decide the next step", () => {
     const message = generateLeaderMailboxTriggerMessage(
       "team-mail",
@@ -1119,15 +1130,15 @@ describe("worker bootstrap", () => {
       message,
       /Read .*\.omx\/state\/team\/team-mail\/mailbox\/leader-fixed\.json/,
     );
-    assert.match(message, /worker-2 sent a new message/);
-    assert.match(message, /Review it and decide the next concrete step/);
+    assert.match(message, /msg from worker-2/);
+    assert.match(message, /Otherwise review; decide next step/);
     assert.doesNotMatch(message, /\bReply\b/i);
   });
 
   it("buildLeaderMailboxTriggerDirective records leader mailbox-review intent separately", () => {
     const directive = buildLeaderMailboxTriggerDirective("team-mail", "worker-2");
     assert.equal(directive.intent, "pending-mailbox-review");
-    assert.match(directive.text, /worker-2 sent a new message/);
+    assert.match(directive.text, /msg from worker-2/);
     assert.doesNotMatch(directive.text, /OMX_INTENT/);
   });
 
@@ -1141,8 +1152,8 @@ describe("worker bootstrap", () => {
       message,
       /read .*\$OMX_TEAM_STATE_ROOT\/team\/team-mail\/mailbox\/leader-fixed\.json/i,
     );
-    assert.match(message, /new msg from worker-2/i);
-    assert.match(message, /review it; decide next step/i);
+    assert.match(message, /msg from worker-2/i);
+    assert.match(message, /Otherwise review; decide next step/i);
     assert.doesNotMatch(message, /\breply\b/i);
     assert.ok(message.length < 200);
   });
@@ -1336,15 +1347,16 @@ describe("worker bootstrap", () => {
     assert.match(content, /<identity>You are Writer\.<\/identity>/);
   });
 
-  it("writeWorkerWorktreeRootAgentsFile composes project AGENTS while remove restores tracked content", async () => {
+  it("writeWorkerWorktreeRootAgentsFile writes instructions to .omx state and preserves tracked worktree AGENTS", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-worker-root-agents-"));
     const worktree = join(cwd, "worktree");
     try {
       await mkdir(join(cwd, ".omx", "state", "team", "restore-team", "workers", "worker-1"), { recursive: true });
       await mkdir(worktree, { recursive: true });
+      const originalAgents = "# Base tracked AGENTS\n\nMUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL\n";
       await writeFile(
         join(worktree, "AGENTS.md"),
-        "# Base tracked AGENTS\n\nMUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL\n",
+        originalAgents,
         "utf8",
       );
 
@@ -1358,15 +1370,27 @@ describe("worker bootstrap", () => {
         worktreePath: worktree,
       });
 
+      // Instructions file should be in .omx state directory, not the worktree
+      assert.equal(outPath, join(cwd, ".omx", "state", "team", "restore-team", "workers", "worker-1", "AGENTS.md"));
+
       const generated = await readFile(outPath, "utf8");
       assert.match(generated, /# Base tracked AGENTS/);
       assert.match(generated, /MUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL/);
       assert.match(generated, /Team Worker Runtime Instructions/);
       assert.match(generated, /Writer role prompt/);
 
+      // Verify worktree AGENTS.md is NOT modified
+      const worktreeContent = await readFile(join(worktree, "AGENTS.md"), "utf8");
+      assert.equal(worktreeContent, originalAgents);
+
+      // Remove should delete the instructions file from .omx state
       await removeWorkerWorktreeRootAgentsFile("restore-team", "worker-1", join(cwd, ".omx", "state"), worktree);
-      const restored = await readFile(join(worktree, "AGENTS.md"), "utf8");
-      assert.equal(restored, "# Base tracked AGENTS\n\nMUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL\n");
+      const instructionsExist = existsSync(outPath);
+      assert.equal(instructionsExist, false);
+
+      // Worktree AGENTS.md should still have original content
+      const worktreeContentAfter = await readFile(join(worktree, "AGENTS.md"), "utf8");
+      assert.equal(worktreeContentAfter, originalAgents);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1377,12 +1401,13 @@ describe("worker bootstrap", () => {
     const worktree = join(cwd, "worktree");
     const codexHome = join(cwd, "codex-home");
     const restoreCodexHome = setMockCodexHome(codexHome);
+    const projectAgents = "# Project Instructions\n\nPROJECT_SENTINEL\n";
     try {
       await mkdir(join(cwd, ".omx", "state", "team", "compose-team", "workers", "worker-1"), { recursive: true });
       await mkdir(worktree, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await writeFile(join(codexHome, "AGENTS.md"), "# User Instructions\n\nUSER_SENTINEL\n", "utf8");
-      await writeFile(join(worktree, "AGENTS.md"), "# Project Instructions\n\nPROJECT_SENTINEL\n", "utf8");
+      await writeFile(join(worktree, "AGENTS.md"), projectAgents, "utf8");
 
       const outPath = await writeWorkerWorktreeRootAgentsFile({
         teamName: "compose-team",
@@ -1394,6 +1419,9 @@ describe("worker bootstrap", () => {
         worktreePath: worktree,
       });
 
+      // Verify instructions are written to .omx state directory
+      assert.equal(outPath, join(cwd, ".omx", "state", "team", "compose-team", "workers", "worker-1", "AGENTS.md"));
+
       const generated = await readFile(outPath, "utf8");
       assert.match(generated, /# User Instructions/);
       assert.match(generated, /USER_SENTINEL/);
@@ -1403,6 +1431,10 @@ describe("worker bootstrap", () => {
       assert.match(generated, /<identity>Writer role prompt<\/identity>/);
       assert.ok(generated.indexOf("USER_SENTINEL") < generated.indexOf("PROJECT_SENTINEL"));
       assert.ok(generated.indexOf("PROJECT_SENTINEL") < generated.indexOf("Team Worker Runtime Instructions"));
+
+      // Verify worktree AGENTS.md is NOT modified
+      const worktreeContent = await readFile(join(worktree, "AGENTS.md"), "utf8");
+      assert.equal(worktreeContent, projectAgents);
     } finally {
       restoreCodexHome();
       await rm(cwd, { recursive: true, force: true });

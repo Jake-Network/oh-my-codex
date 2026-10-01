@@ -24,6 +24,8 @@ import {
   sanitizePreviousNotifyCommand,
   stripExistingOmxBlocks,
   stripManagedCodexHookTrustState,
+  migrateManagedCodexHookTrustStateCoordinates,
+  migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged,
   stripOmxEnvSettings,
   stripOmxTopLevelKeys,
   stripOmxFeatureFlags,
@@ -34,8 +36,10 @@ import {
   buildManagedCodexNativeHookWindowsShimContent,
   buildManagedCodexNativeHookWindowsShimPath,
   classifyManagedCodexNativeHookWindowsShimOwnership,
+  escapeTomlBasicString,
   planManagedCodexHooksRemoval,
   ManagedCodexHooksPlanError,
+  type ManagedCodexHookCoordinateMove,
   type ManagedCodexHookTrustState,
   type ManagedCodexHooksPlan,
 } from "../config/codex-hooks.js";
@@ -181,7 +185,6 @@ function detectOmxConfigArtifacts(config: string): {
     /^\s*developer_instructions\s*=.*oh-my-codex/m.test(config);
 
   const hasFeatureFlags =
-    /^\s*child_agents_md\s*=\s*true/m.test(config) ||
     /^\s*hooks\s*=\s*true/m.test(config) ||
     /^\s*codex_hooks\s*=\s*true/m.test(config) ||
     /^\s*goals\s*=\s*true/m.test(config) ||
@@ -618,6 +621,7 @@ interface PlannedConfigCleanup {
   config: FileSnapshot;
   finalContent: string | null;
   result: ConfigCleanupSummary;
+  trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"];
 }
 
 async function planConfigCleanup(
@@ -629,6 +633,7 @@ async function planConfigCleanup(
     preserveHooksFeatureFlag?: boolean;
     priorHookTrustState?: Record<string, ManagedCodexHookTrustState>;
     finalHookTrustState?: Record<string, ManagedCodexHookTrustState>;
+    coordinateMoves?: readonly ManagedCodexHookCoordinateMove[];
     notifyMetadata?: PlannedNotifyMetadata;
   },
 ): Promise<PlannedConfigCleanup> {
@@ -643,7 +648,7 @@ async function planConfigCleanup(
 
   const original = configSnapshot.content;
   if (original === null) {
-    return { config: configSnapshot, finalContent: null, result };
+    return { config: configSnapshot, finalContent: null, result, trustKeyRewrites: [] };
   }
 
   const detected = detectOmxConfigArtifacts(original);
@@ -685,10 +690,15 @@ async function planConfigCleanup(
 
   // Remove only trust tables whose hashes and coordinates match the planned
   // managed hooks before their removal. User-owned conflicts remain intact.
-  config = stripManagedCodexHookTrustState(config, {
-    priorManagedHookTrustState: options.priorHookTrustState,
-    managedTrustState: options.finalHookTrustState,
-  });
+  const trustMigration = migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+    config,
+    options.coordinateMoves ?? [],
+    {
+      priorManagedHookTrustState: options.priorHookTrustState,
+      managedTrustState: options.finalHookTrustState,
+    },
+  );
+  config = trustMigration.config;
 
   // Strip feature flags
   config = stripOmxFeatureFlags(config, { preserveMultiAgent: true });
@@ -709,7 +719,7 @@ async function planConfigCleanup(
   config = config.trimEnd() + "\n";
   result.configCleaned = config !== original;
 
-  return { config: configSnapshot, finalContent: config, result };
+  return { config: configSnapshot, finalContent: config, result, trustKeyRewrites: trustMigration.keyRewrites };
 }
 
 async function removeInstalledPrompts(
@@ -1776,7 +1786,7 @@ function printSummary(summary: UninstallSummary, dryRun: boolean): void {
     }
     if (summary.featureFlagsRemoved) {
       console.log(
-        "    Feature flags (child_agents_md, goals; multi_agent and hooks are preserved when user-owned)",
+        "    Feature flags (goals; multi_agent and hooks are preserved when user-owned)",
       );
     }
   } else if (summary.mcpServersRemoved.length === 0) {
@@ -1865,6 +1875,26 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
     transactionPlatform,
     scopeDirs.codexHomeDir,
   );
+  if (keepConfig && hooksRemoval.plan) {
+    const trustMigration = migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+      configSnapshot.content ?? "",
+      hooksRemoval.plan.coordinateMoves,
+      {
+        priorManagedHookTrustState: hooksRemoval.plan.priorTrustState,
+        managedTrustState: hooksRemoval.plan.finalTrustState,
+      },
+    );
+    if (trustMigration.keyRewrites.length > 0) {
+      const rewrites = trustMigration.keyRewrites
+        .map((rewrite) => `[hooks.state."${escapeTomlBasicString(rewrite.oldKey)}"] -> [hooks.state."${escapeTomlBasicString(rewrite.newKey)}"]`)
+        .join("; ");
+      throw new ManagedCodexHooksPlanError(
+        "unsafe_managed_removal",
+        `Removing OMX hooks requires updating config.toml to preserve existing foreign hook trust, but --keep-config forbids that write. Reconcile these [hooks.state] keys explicitly: ${rewrites}.`,
+        { coordinateMoves: hooksRemoval.plan.coordinateMoves, keyRewrites: trustMigration.keyRewrites },
+      );
+    }
+  }
   const notifyMetadata = keepConfig
     ? undefined
     : await planNotifyMetadata(configSnapshot, scopeDirs.codexHomeDir);
@@ -1877,6 +1907,7 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
           preserveHooksFeatureFlag,
           priorHookTrustState: hooksRemoval.plan?.priorTrustState,
           finalHookTrustState: hooksRemoval.plan?.finalTrustState,
+          coordinateMoves: hooksRemoval.plan?.coordinateMoves,
           notifyMetadata,
           codexFeaturesProbe: options.codexFeaturesProbe,
           codexVersionProbe: options.codexVersionProbe,
@@ -1930,6 +1961,24 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
     console.log("[dry-run mode] No files will be modified.\n");
   }
   console.log(`Resolved scope: ${scope}\n`);
+
+  if (dryRun || verbose) {
+    for (const coordinate of hooksRemoval.plan?.removedCoordinates ?? []) {
+      console.log(
+        `  ${dryRun ? "Would remove" : "Removing"} OMX hook ${coordinate.eventName} [${coordinate.groupIndex},${coordinate.handlerIndex}]`,
+      );
+    }
+    for (const move of hooksRemoval.plan?.coordinateMoves ?? []) {
+      console.log(
+        `  ${dryRun ? "Would move" : "Moving"} foreign hook ${move.eventName} [${move.oldGroupIndex},${move.oldHandlerIndex}] -> [${move.newGroupIndex},${move.newHandlerIndex}]`,
+      );
+    }
+    for (const rewrite of configCleanup?.trustKeyRewrites ?? []) {
+      console.log(
+        `  ${dryRun ? "Would rewrite" : "Rewrote"} [hooks.state."${escapeTomlBasicString(rewrite.oldKey)}"] -> [hooks.state."${escapeTomlBasicString(rewrite.newKey)}"] (trusted_hash unchanged)`,
+      );
+    }
+  }
 
   const summary: UninstallSummary = {
     configCleaned: false,

@@ -4,6 +4,8 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { runWatchMode } from '../index.js';
+import { OMX_TMUX_HUD_OWNER_ENV } from '../reconcile.js';
+import { OMX_TMUX_HUD_LEADER_PANE_ENV, type TmuxPaneSnapshot } from '../tmux.js';
 import type { HudFlags, HudRenderContext } from '../types.js';
 
 const WATCH_FLAGS: HudFlags = {
@@ -27,6 +29,32 @@ function emptyCtx(): HudRenderContext {
     metrics: null,
     hudNotify: null,
     session: null,
+  };
+}
+
+function ownedHudPanes(heightLines = 2): TmuxPaneSnapshot[] {
+  return [
+    {
+      paneId: '%1', currentCommand: 'codex', startCommand: 'codex', panePid: '101',
+      sessionId: '$1', windowId: '@1', paneLeft: 0, paneTop: 0, paneWidth: 80,
+      paneHeight: 20, paneBottom: 19, windowWidth: 80, windowHeight: 23,
+    },
+    {
+      paneId: '%2', currentCommand: 'node', panePid: '102', sessionId: '$1', windowId: '@1',
+      startCommand: "exec env OMX_SESSION_ID='detached-test' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx hud --watch",
+      paneLeft: 0, paneTop: 21, paneWidth: 80, paneHeight: heightLines,
+      paneBottom: 20 + heightLines, windowWidth: 80, windowHeight: 23,
+    },
+  ];
+}
+
+function ownedHudEnv(): NodeJS.ProcessEnv {
+  return {
+    TMUX: '/private/tmux-501/default,1,0',
+    TMUX_PANE: '%2',
+    OMX_SESSION_ID: 'detached-test',
+    [OMX_TMUX_HUD_OWNER_ENV]: '1',
+    [OMX_TMUX_HUD_LEADER_PANE_ENV]: '%1',
   };
 }
 
@@ -59,6 +87,343 @@ afterEach(() => {
 });
 
 describe('runWatchMode detached attachment gating (closes #3577)', () => {
+  it('uses the layout projection to resize an owned HUD while detached', async () => {
+    let sigintHandler: (() => void) | undefined;
+    let timerTick: (() => void) | undefined;
+    let projectionReads = 0;
+    let paneHeight = 2;
+    const resized: number[] = [];
+    const hooks: number[] = [];
+    const secondAuthority = deferred();
+    let authorityCalls = 0;
+
+    const promise = runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: ownedHudEnv(),
+      isOwnerAliveFn: async () => true,
+      readHudLeaderOwnerFn: () => 'current',
+      isSessionAttachedFn: () => false,
+      listCurrentWindowPanesFn: () => ownedHudPanes(paneHeight),
+      readHudHookHealthFn: () => 'healthy',
+      readAllStateFn: async () => emptyCtx(),
+      readHudLayoutProjectionFn: async () => {
+        projectionReads += 1;
+        return { ultragoalActive: true, teamWorkerCount: 0 };
+      },
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+      renderHudFn: () => 'frame',
+      resizeTmuxPaneFn: (_paneId, heightLines) => {
+        resized.push(heightLines);
+        paneHeight = heightLines;
+        return true;
+      },
+      registerHudResizeHookFn: (_hudPaneId, _leaderPaneId, heightLines) => {
+        hooks.push(heightLines);
+        return true;
+      },
+      clearTmuxPaneHistoryFn: () => true,
+      reconcileTmuxHudFn: async () => {},
+      runAuthorityTickFn: async () => {
+        authorityCalls += 1;
+        if (authorityCalls === 2) secondAuthority.resolve();
+      },
+      writeStdout: () => {},
+      writeStderr: () => {},
+      registerSigint: (handler) => { sigintHandler = handler; },
+      setIntervalFn: (handler) => {
+        timerTick = handler;
+        return ({}) as ReturnType<typeof setInterval>;
+      },
+      clearIntervalFn: () => {},
+    });
+
+    await flush();
+    timerTick?.();
+    await withTimeout(secondAuthority.promise, 'detached layout projection tick should complete');
+    sigintHandler?.();
+    await promise;
+
+    assert.equal(projectionReads, 1);
+    assert.deepEqual(resized, [3]);
+    assert.deepEqual(hooks, [3]);
+  });
+
+  it('avoids full state and render reads after the first owned-HUD frame while detached', async () => {
+    let sigintHandler: (() => void) | undefined;
+    let timerTick: (() => void) | undefined;
+    let configReads = 0;
+    let stateReads = 0;
+    let renders = 0;
+    let projectionReads = 0;
+    let repairs = 0;
+    const fourthAuthority = deferred();
+    let authorityCalls = 0;
+
+    const promise = runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: ownedHudEnv(),
+      isOwnerAliveFn: async () => true,
+      readHudLeaderOwnerFn: () => 'current',
+      isSessionAttachedFn: () => false,
+      listCurrentWindowPanesFn: () => ownedHudPanes(),
+      readHudHookHealthFn: () => 'healthy',
+      readHudConfigFn: async () => {
+        configReads += 1;
+        return { preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } };
+      },
+      readAllStateFn: async () => {
+        stateReads += 1;
+        return emptyCtx();
+      },
+      readHudLayoutProjectionFn: async () => {
+        projectionReads += 1;
+        return { ultragoalActive: false, teamWorkerCount: 0 };
+      },
+      renderHudFn: () => {
+        renders += 1;
+        return 'frame';
+      },
+      reconcileTmuxHudFn: async () => { repairs += 1; },
+      runAuthorityTickFn: async () => {
+        authorityCalls += 1;
+        if (authorityCalls === 4) fourthAuthority.resolve();
+      },
+      writeStdout: () => {},
+      writeStderr: () => {},
+      registerSigint: (handler) => { sigintHandler = handler; },
+      setIntervalFn: (handler) => {
+        timerTick = handler;
+        return ({}) as ReturnType<typeof setInterval>;
+      },
+      clearIntervalFn: () => {},
+    });
+
+    await flush();
+    timerTick?.();
+    await flush();
+    timerTick?.();
+    await flush();
+    timerTick?.();
+    await withTimeout(fourthAuthority.promise, 'three detached projection ticks should complete');
+    sigintHandler?.();
+    await promise;
+
+    assert.equal(configReads, 1);
+    assert.equal(stateReads, 1);
+    assert.equal(renders, 1);
+    assert.equal(projectionReads, 3);
+    assert.equal(repairs, 0);
+  });
+
+  it('requests repair when an owned detached HUD is missing a required hook', async () => {
+    let sigintHandler: (() => void) | undefined;
+    let timerTick: (() => void) | undefined;
+    let hookChecks = 0;
+    let repairs = 0;
+    const repairStarted = deferred();
+
+    const promise = runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: ownedHudEnv(),
+      isOwnerAliveFn: async () => true,
+      readHudLeaderOwnerFn: () => 'current',
+      isSessionAttachedFn: () => false,
+      listCurrentWindowPanesFn: () => ownedHudPanes(),
+      readHudHookHealthFn: () => {
+        hookChecks += 1;
+        return hookChecks === 1 ? 'healthy' : 'repair_needed';
+      },
+      readAllStateFn: async () => emptyCtx(),
+      readHudLayoutProjectionFn: async () => ({ ultragoalActive: false, teamWorkerCount: 0 }),
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+      renderHudFn: () => 'frame',
+      reconcileTmuxHudFn: async () => {
+        repairs += 1;
+        repairStarted.resolve();
+      },
+      runAuthorityTickFn: async () => {},
+      writeStdout: () => {},
+      writeStderr: () => {},
+      registerSigint: (handler) => { sigintHandler = handler; },
+      setIntervalFn: (handler) => {
+        timerTick = handler;
+        return ({}) as ReturnType<typeof setInterval>;
+      },
+      clearIntervalFn: () => {},
+    });
+
+    await flush();
+    timerTick?.();
+    await withTimeout(repairStarted.promise, 'missing hook should request detached HUD repair');
+    sigintHandler?.();
+    await promise;
+
+    assert.equal(hookChecks, 2);
+    assert.equal(repairs, 1);
+  });
+
+  it('closes its exact owned pane without mutation when leader ownership mismatches', async () => {
+    let closes = 0;
+    let repairs = 0;
+    let resizes = 0;
+    let hookWrites = 0;
+    let stateReads = 0;
+
+    await runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: ownedHudEnv(),
+      isOwnerAliveFn: async () => true,
+      readHudLeaderOwnerFn: () => 'mismatch',
+      isSessionAttachedFn: () => false,
+      readAllStateFn: async () => {
+        stateReads += 1;
+        return emptyCtx();
+      },
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+      renderHudFn: () => 'frame',
+      resizeTmuxPaneFn: () => { resizes += 1; return true; },
+      registerHudResizeHookFn: () => { hookWrites += 1; return true; },
+      reconcileTmuxHudFn: async () => { repairs += 1; },
+      closeOwnedPaneFn: () => { closes += 1; },
+      runAuthorityTickFn: async () => {},
+      writeStdout: () => {},
+      writeStderr: () => {},
+      registerSigint: () => {},
+      setIntervalFn: () => ({}) as ReturnType<typeof setInterval>,
+      clearIntervalFn: () => {},
+    });
+
+    assert.equal(closes, 1);
+    assert.equal(stateReads, 0);
+    assert.equal(repairs, 0);
+    assert.equal(resizes, 0);
+    assert.equal(hookWrites, 0);
+  });
+
+  it('suppresses repair, resize, and hook writes while leader ownership is unknown', async () => {
+    let sigintHandler: (() => void) | undefined;
+    let timerTick: (() => void) | undefined;
+    let hookChecks = 0;
+    let repairs = 0;
+    let resizes = 0;
+    let hookWrites = 0;
+    let closes = 0;
+    const secondAuthority = deferred();
+    let authorityCalls = 0;
+
+    const promise = runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: ownedHudEnv(),
+      isOwnerAliveFn: async () => true,
+      readHudLeaderOwnerFn: () => 'unknown',
+      isSessionAttachedFn: () => false,
+      listCurrentWindowPanesFn: () => ownedHudPanes(),
+      readHudHookHealthFn: () => {
+        hookChecks += 1;
+        return hookChecks === 1 ? 'healthy' : 'repair_needed';
+      },
+      readAllStateFn: async () => ({
+        ...emptyCtx(),
+        ultragoal: {
+          active: true,
+          status: 'in_progress',
+          total: 1,
+          complete: 0,
+          pending: 0,
+          inProgress: 1,
+          failed: 0,
+          reviewBlocked: 0,
+          needsUserDecision: 0,
+          progressTotal: 1,
+        },
+      }),
+      readHudLayoutProjectionFn: async () => ({ ultragoalActive: true, teamWorkerCount: 0 }),
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+      renderHudFn: () => 'frame',
+      resizeTmuxPaneFn: () => { resizes += 1; return true; },
+      registerHudResizeHookFn: () => { hookWrites += 1; return true; },
+      reconcileTmuxHudFn: async () => { repairs += 1; },
+      closeOwnedPaneFn: () => { closes += 1; },
+      runAuthorityTickFn: async () => {
+        authorityCalls += 1;
+        if (authorityCalls === 2) secondAuthority.resolve();
+      },
+      writeStdout: () => {},
+      writeStderr: () => {},
+      registerSigint: (handler) => { sigintHandler = handler; },
+      setIntervalFn: (handler) => {
+        timerTick = handler;
+        return ({}) as ReturnType<typeof setInterval>;
+      },
+      clearIntervalFn: () => {},
+    });
+
+    await flush();
+    timerTick?.();
+    await withTimeout(secondAuthority.promise, 'unknown owner tick should remain observational');
+    sigintHandler?.();
+    await promise;
+
+    assert.equal(hookChecks, 2);
+    assert.equal(repairs, 0);
+    assert.equal(resizes, 0);
+    assert.equal(hookWrites, 0);
+    assert.equal(closes, 0);
+  });
+
+  it('backs off identical failed detached repair attempts', async () => {
+    let sigintHandler: (() => void) | undefined;
+    let timerTick: (() => void) | undefined;
+    let repairs = 0;
+    let authorityCalls = 0;
+    const secondAuthority = deferred();
+    const secondRepair = deferred();
+
+    const promise = runWatchMode('/repo', WATCH_FLAGS, {
+      isTTY: true,
+      env: ownedHudEnv(),
+      isOwnerAliveFn: async () => true,
+      readHudLeaderOwnerFn: () => 'current',
+      isSessionAttachedFn: () => false,
+      listCurrentWindowPanesFn: () => ownedHudPanes(),
+      readHudHookHealthFn: () => 'repair_needed',
+      readAllStateFn: async () => emptyCtx(),
+      readHudLayoutProjectionFn: async () => ({ ultragoalActive: false, teamWorkerCount: 0 }),
+      readHudConfigFn: async () => ({ preset: 'focused', git: { display: 'repo-branch' }, statusLine: { preset: 'focused' } }),
+      renderHudFn: () => 'frame',
+      reconcileTmuxHudFn: async () => {
+        repairs += 1;
+        if (repairs === 2) secondRepair.resolve();
+        return false;
+      },
+      runAuthorityTickFn: async () => {
+        authorityCalls += 1;
+        if (authorityCalls === 2) secondAuthority.resolve();
+      },
+      writeStdout: () => {},
+      writeStderr: () => {},
+      registerSigint: (handler) => { sigintHandler = handler; },
+      setIntervalFn: (handler) => {
+        timerTick = handler;
+        return ({}) as ReturnType<typeof setInterval>;
+      },
+      clearIntervalFn: () => {},
+    });
+
+    await flush();
+    assert.equal(repairs, 1);
+    timerTick?.();
+    await withTimeout(secondAuthority.promise, 'immediate retry tick should complete');
+    assert.equal(repairs, 1);
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    timerTick?.();
+    await withTimeout(secondRepair.promise, 'failed repair should retry after backoff');
+    sigintHandler?.();
+    await promise;
+
+    assert.equal(repairs, 2);
+  });
+
   it('skips render-only work while detached but keeps the authority tick running', async () => {
     const writes: string[] = [];
     let stateReads = 0;

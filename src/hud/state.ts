@@ -55,6 +55,14 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
 
 async function readAuthoritativeModeState<T>(cwd: string, mode: string): Promise<T | null> {
   const sessionId = await readCurrentSessionId(cwd);
+  return readAuthoritativeModeStateForSession<T>(cwd, mode, sessionId);
+}
+
+async function readAuthoritativeModeStateForSession<T>(
+  cwd: string,
+  mode: string,
+  sessionId: string | undefined,
+): Promise<T | null> {
   return readJsonFile<T>(getStateFilePath(`${mode}-state.json`, cwd, sessionId));
 }
 
@@ -439,21 +447,28 @@ export async function readTeamState(cwd: string): Promise<TeamStateForHud | null
   return state?.active ? readTeamWorkers(cwd, state) : null;
 }
 
-async function readTeamWorkers(cwd: string, team: TeamStateForHud | null, stateRoot = getBaseStateDir(cwd)): Promise<TeamStateForHud | null> {
-  const name = sanitizeOptionalString(team?.team_name);
-  if (!team?.active || !name || !TEAM_NAME_SAFE_PATTERN.test(name)) return team;
+type TeamRosterMember = Record<string, unknown> & { name: string };
+
+async function readTeamMembers(stateRoot: string, name: string): Promise<TeamRosterMember[] | null> {
   const teamDir = join(stateRoot, 'team', name);
-  // Lifecycle config readers can migrate/recover state. A HUD tick must only read.
+  // HUD tick 只读取 roster 文件，不调用会迁移或修复 Team state 的 lifecycle reader。
   const manifest = await readJsonFile<{ name?: unknown; workers?: unknown }>(join(teamDir, 'manifest.v2.json'));
   const config = manifest ?? await readJsonFile<{ name?: unknown; workers?: unknown }>(join(teamDir, 'config.json'));
-  if (config?.name !== name || !Array.isArray(config.workers)) return team;
+  if (config?.name !== name || !Array.isArray(config.workers)) return null;
   const seen = new Set<string>();
-  const members = config.workers.slice(0, ABSOLUTE_MAX_WORKERS).filter((value): value is Record<string, unknown> & { name: string } => {
+  return config.workers.slice(0, ABSOLUTE_MAX_WORKERS).filter((value): value is TeamRosterMember => {
     if (!value || typeof value !== 'object' || typeof value.name !== 'string') return false;
     if (!WORKER_NAME_SAFE_PATTERN.test(value.name) || seen.has(value.name)) return false;
     seen.add(value.name);
     return true;
   });
+}
+
+async function readTeamWorkers(cwd: string, team: TeamStateForHud | null, stateRoot = getBaseStateDir(cwd)): Promise<TeamStateForHud | null> {
+  const name = sanitizeOptionalString(team?.team_name);
+  if (!team?.active || !name || !TEAM_NAME_SAFE_PATTERN.test(name)) return team;
+  const members = await readTeamMembers(stateRoot, name);
+  if (!members) return team;
   const workers = await Promise.all(members.map(async member => {
     const workerName = member.name;
     const status = await teamReadWorkerStatus(name, workerName, cwd, stateRoot);
@@ -713,6 +728,61 @@ function mergeTeamPhase(
   return { active: true, current_phase: canonicalPhase };
 }
 
+function resolveUltragoalForHud(
+  canonicalSkills: Map<string, { phase?: string }>,
+  artifact: UltragoalStateForHud | null,
+  detail: UltragoalStateForHud | null,
+): UltragoalStateForHud | null {
+  return artifact
+    ?? (shouldSurfaceCanonicalSkill(canonicalSkills, 'ultragoal', detail)
+      ? mergePhase(detail?.active === true ? detail : null, canonicalPhaseForSkill(canonicalSkills, 'ultragoal'))
+      : null);
+}
+
+function resolveTeamForHud(
+  canonicalSkills: Map<string, { phase?: string }>,
+  detail: TeamStateForHud | null,
+  canonicalTeamPhase?: string,
+): TeamStateForHud | null {
+  return shouldSurfaceCanonicalSkill(canonicalSkills, 'team', detail)
+    ? mergeTeamPhase(
+      detail?.active === true ? detail : null,
+      canonicalPhaseForSkill(canonicalSkills, 'team'),
+      canonicalTeamPhase,
+    )
+    : null;
+}
+
+export interface HudLayoutProjection {
+  ultragoalActive: boolean;
+  teamWorkerCount: number;
+}
+
+export async function readHudLayoutProjection(cwd: string): Promise<HudLayoutProjection> {
+  const stateDir = getBaseStateDir(cwd);
+  const currentSessionId = await readCurrentSessionId(cwd);
+  const [canonicalSkillState, ultragoalArtifact, ultragoalDetail, teamDetail] = await Promise.all([
+    readVisibleSkillActiveStateForStateDir(stateDir, currentSessionId),
+    readUltragoalState(cwd),
+    readAuthoritativeModeStateForSession<UltragoalStateForHud>(cwd, 'ultragoal', currentSessionId),
+    readAuthoritativeModeStateForSession<TeamStateForHud>(cwd, 'team', currentSessionId),
+  ]);
+  const canonicalSkills = new Map(
+    listActiveSkills(canonicalSkillState).map((entry) => [entry.skill, entry] as const),
+  );
+  const ultragoal = resolveUltragoalForHud(canonicalSkills, ultragoalArtifact, ultragoalDetail);
+  const team = resolveTeamForHud(canonicalSkills, teamDetail);
+  const teamName = sanitizeOptionalString(team?.team_name);
+  const members = team?.active === true && teamName && TEAM_NAME_SAFE_PATTERN.test(teamName)
+    ? await readTeamMembers(stateDir, teamName)
+    : null;
+
+  return {
+    ultragoalActive: ultragoal?.active === true,
+    teamWorkerCount: members?.length ?? 0,
+  };
+}
+
 function activeAutopilotPhase(autopilot: AutopilotStateForHud | null): string | undefined {
   if (autopilot?.active !== true) return undefined;
   return sanitizeOptionalString(autopilot.current_phase)?.toLowerCase().replace(/_/g, '-');
@@ -835,10 +905,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
   const ralph = shouldSurfaceCanonicalSkill(canonicalSkills, 'ralph', ralphDetail)
     ? mergePhase(ralphDetail?.active === true ? ralphDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ralph'))
     : null;
-  const ultragoal = ultragoalArtifact
-    ?? (shouldSurfaceCanonicalSkill(canonicalSkills, 'ultragoal', ultragoalDetail)
-      ? mergePhase(ultragoalDetail?.active === true ? ultragoalDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ultragoal'))
-      : null);
+  const ultragoal = resolveUltragoalForHud(canonicalSkills, ultragoalArtifact, ultragoalDetail);
   const ultrawork = shouldSurfaceCanonicalSkill(canonicalSkills, 'ultrawork', ultraworkDetail)
     ? mergePhase(ultraworkDetail?.active === true ? ultraworkDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ultrawork'))
     : null;
@@ -876,13 +943,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     })()
     : supervisedAutopilotStage<UltraqaStateForHud>(autopilot, 'ultraqa');
   const canonicalTeamPhase = await readCanonicalTeamPhase(cwd, teamDetail?.active === true ? teamDetail : null);
-  const team = shouldSurfaceCanonicalSkill(canonicalSkills, 'team', teamDetail)
-    ? mergeTeamPhase(
-      teamDetail?.active === true ? teamDetail : null,
-      canonicalPhaseForSkill(canonicalSkills, 'team'),
-      canonicalTeamPhase,
-    )
-    : null;
+  const team = resolveTeamForHud(canonicalSkills, teamDetail, canonicalTeamPhase);
   const autoresearch = shouldSurfaceCanonicalSkill(canonicalSkills, 'autoresearch', autoresearchDetail)
     ? mergePhase(
       autoresearchDetail?.active === true ? autoresearchDetail : null,

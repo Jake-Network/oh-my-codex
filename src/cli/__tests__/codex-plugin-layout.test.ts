@@ -128,6 +128,7 @@ async function createPluginMirrorFixtureRoot(): Promise<string> {
     cp(join(root, 'package.json'), join(fixtureRoot, 'package.json')),
     cp(join(root, 'plugins', pluginName), join(fixtureRoot, 'plugins', pluginName), { recursive: true }),
     cp(join(root, 'skills'), join(fixtureRoot, 'skills'), { recursive: true }),
+    cp(join(root, 'templates'), join(fixtureRoot, 'templates'), { recursive: true }),
     cp(join(root, 'src', 'catalog', 'manifest.json'), join(fixtureRoot, 'src', 'catalog', 'manifest.json')),
   ]);
   return fixtureRoot;
@@ -416,6 +417,7 @@ describe('official Codex plugin layout', () => {
   it('defines a plugin manifest under a plugin root and keeps .codex-plugin limited to plugin.json', async () => {
     const pkg = await readJson<PackageJson>(join(root, 'package.json'));
     const manifest = await readJson<PluginManifest>(pluginManifestPath);
+    const manifestRaw = await readJson<Record<string, unknown>>(pluginManifestPath);
     const codexPluginEntries = await readdir(join(pluginRoot, '.codex-plugin'));
 
     assert.deepEqual(codexPluginEntries.sort(), ['plugin.json']);
@@ -425,6 +427,7 @@ describe('official Codex plugin layout', () => {
     assert.equal(manifest.skills, './skills/');
     assert.equal(manifest.mcpServers, './.mcp.json');
     assert.equal(manifest.apps, './.app.json');
+    assert.equal(manifestRaw.templates, undefined, 'plugin manifest should not include templates key');
     assert.equal(manifest.interface?.displayName, 'oh-my-codex');
     assert.equal(manifest.interface?.category, 'Developer Tools');
     assert.ok(manifest.interface?.shortDescription, 'expected short interface description');
@@ -1577,5 +1580,96 @@ process.stdin.on('end', () => {
     assert.match(combined, /legacy setup mode installs native agents(?:\/| and )prompts|plugin setup mode archives stale legacy prompt\/native-agent files/);
     assert.match(combined, /plugin-scoped companion metadata for official Codex lifecycle hooks/i);
     assert.match(combined, /legacy\/fallback native Codex hook registrations|legacy setup mode installs prompts\/native agents and \.codex\/hooks\.json/i);
+  });
+
+  it('fails sync:plugin:check when plugin template is missing', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesPath = join(fixtureRoot, 'plugins', pluginName, 'templates', 'AGENTS.md');
+      // Remove the template file to simulate it being missing
+      await rm(pluginTemplatesPath);
+      // Should fail in check mode
+      let failed = false;
+      try {
+        const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+        await syncPluginMirror({ root: fixtureRoot, check: true });
+      } catch (e) {
+        failed = true;
+        const error = e instanceof Error ? e.message : String(e);
+        assert.match(error, /plugin_template_out_of_sync/);
+        assert.match(error, /missing/);
+      }
+      assert.equal(failed, true, 'expected check mode to fail when template is missing');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails sync:plugin:check when plugin template is stale', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesPath = join(fixtureRoot, 'plugins', pluginName, 'templates', 'AGENTS.md');
+      // Corrupt the template file to simulate it being stale
+      await writeFile(pluginTemplatesPath, 'corrupted content');
+      // Should fail in check mode
+      let failed = false;
+      try {
+        const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+        await syncPluginMirror({ root: fixtureRoot, check: true });
+      } catch (e) {
+        failed = true;
+        const error = e instanceof Error ? e.message : String(e);
+        assert.match(error, /plugin_template_out_of_sync/);
+        assert.match(error, /stale/);
+      }
+      assert.equal(failed, true, 'expected check mode to fail when template is stale');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('includes template changes in the changed result', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesPath = join(fixtureRoot, 'plugins', pluginName, 'templates', 'AGENTS.md');
+      // Remove the template file to simulate it being missing
+      await rm(pluginTemplatesPath);
+      // Sync should report changed=true even if skills and metadata already match
+      const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+      const result = await syncPluginMirror({ root: fixtureRoot, verbose: false });
+      assert.equal(result.changed, true, 'expected changed=true when template was missing and needed to be synced');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails sync:plugin:check when extra files exist in templates directory', async () => {
+    const fixtureRoot = await createPluginMirrorFixtureRoot();
+    try {
+      const pluginTemplatesDir = join(fixtureRoot, 'plugins', pluginName, 'templates');
+      // Create an extra file in the templates directory
+      await writeFile(join(pluginTemplatesDir, 'extra-file.txt'), 'stray file');
+      // Should fail in check mode
+      let failed = false;
+      try {
+        const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+        await syncPluginMirror({ root: fixtureRoot, check: true });
+      } catch (e) {
+        failed = true;
+        const error = e instanceof Error ? e.message : String(e);
+        assert.match(error, /plugin_template_out_of_sync/);
+        assert.match(error, /templates directory must contain exactly/);
+      }
+      assert.equal(failed, true, 'expected check mode to fail when extra files exist in templates/');
+      // Sync mode should remove the extra file and report changed=true
+      const { syncPluginMirror } = await import('../../scripts/sync-plugin-mirror.js');
+      const result = await syncPluginMirror({ root: fixtureRoot, verbose: false });
+      assert.equal(result.changed, true, 'expected changed=true when extra files were removed');
+      // Verify the extra file is gone
+      const files = await readdir(pluginTemplatesDir);
+      assert.deepEqual(files.sort(), ['AGENTS.md'], 'expected only AGENTS.md to remain');
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -52,6 +52,17 @@ describe("plugin bundle SSOT contract", () => {
 		);
 	});
 
+	it("ensures plugin.json manifest has no templates key (Codex plugin schema constraint)", async () => {
+		const manifest = JSON.parse(
+			await readFile(join(root, "plugins", "oh-my-codex", ".codex-plugin", "plugin.json"), "utf-8"),
+		) as { [key: string]: unknown };
+		assert.equal(
+			manifest.templates,
+			undefined,
+			"plugin.json must not include templates key; Codex plugin manifests only accept skills, apps, mcpServers, hooks, and interface metadata",
+		);
+	});
+
 	it("verifies the checked-in plugin bundle mirrors canonical roots", async () => {
 		const result = await syncPluginMirror({ root, check: true });
 		const expectedSkillNames = [

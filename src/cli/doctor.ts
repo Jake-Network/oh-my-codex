@@ -19,7 +19,7 @@ import {
 import { constants, existsSync, readFileSync, type Stats } from "fs";
 import { access, chown, lstat, mkdir, mkdtemp, readdir, readFile, rename, rmdir, rm } from "fs/promises";
 import { spawnSync } from "child_process";
-import { basename, dirname, join, relative } from "path";
+import { basename, dirname, join, relative, resolve } from "path";
 import { tmpdir } from "os";
 import {
 	codexHome,
@@ -35,6 +35,7 @@ import {
   readCanonicalSessionBindingSnapshot,
   isModeStateFilename,
   normalizeSessionId,
+  verifiedSessionAliases,
   type CanonicalSessionBindingSnapshot,
   type StateRootSource,
 } from "../mcp/state-paths.js";
@@ -54,6 +55,7 @@ import {
 	analyzeLegacyMultiAgentConfig,
 	hasExactOmxSeededBehavioralDefaultsPair,
 	hasLegacyOmxTeamRunTable,
+	migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged,
 } from "../config/generator.js";
 import {
 	MANAGED_HOOK_EVENTS,
@@ -355,10 +357,18 @@ export function sanitizeBindingDiagnosticLine(value: string): string {
 function selectorEvaluation(
   snapshot: CanonicalSessionBindingSnapshot,
   env: NodeJS.ProcessEnv,
-): { nonblank: BindingSelectorName[]; bad: BindingSelectorName[] } {
+): { nonblank: BindingSelectorName[]; bad: BindingSelectorName[]; unverified: BindingSelectorName[] } {
   const nonblank: BindingSelectorName[] = [];
   const bad: BindingSelectorName[] = [];
+  const unverified: BindingSelectorName[] = [];
   const aliases = new Set(Object.values(snapshot.verifiedAliases ?? {}));
+  // identity-indeterminate snapshots carry no verified aliases, but the recorded ids in
+  // session.json still let us tell a matching selector from a demonstrated mismatch.
+  const recordedIds = new Set(
+    snapshot.status === "identity-indeterminate" && snapshot.state
+      ? Object.values(verifiedSessionAliases(snapshot.state))
+      : [],
+  );
   for (const name of BINDING_SELECTOR_NAMES) {
     const raw = env[name];
     if (typeof raw !== "string" || raw.trim() === "") continue;
@@ -369,9 +379,11 @@ function selectorEvaluation(
       : snapshot.status === "usable"
         ? normalized !== undefined && aliases.has(normalized)
         : false;
-    if (!accepted) bad.push(name);
+    if (accepted) continue;
+    if (normalized !== undefined && recordedIds.has(normalized)) unverified.push(name);
+    else bad.push(name);
   }
-  return { nonblank, bad };
+  return { nonblank, bad, unverified };
 }
 
 
@@ -425,14 +437,27 @@ export function formatStateRootSessionBindingDiagnostic(
   env: NodeJS.ProcessEnv = process.env,
   badSelectors?: readonly BindingSelectorName[],
 ): string {
-  const failedSelectorSet = new Set(badSelectors ?? selectorEvaluation(snapshot, env).bad);
-  const failedSelectors = BINDING_SELECTOR_NAMES.filter((name) => failedSelectorSet.has(name));
+  const evaluation = selectorEvaluation(snapshot, env);
+  const failedSelectors =
+    badSelectors !== undefined
+      ? BINDING_SELECTOR_NAMES.filter((name) => badSelectors.includes(name))
+      : evaluation.bad;
+  const unverifiedSelectors = evaluation.unverified.filter((name) => !failedSelectors.includes(name));
   const reportBadSelectors = failedSelectors;
   const inferred = snapshot.rootSource ? undefined : bindingEnvironmentRootSelector(env);
   const source = snapshot.rootSource ?? inferred?.source ?? "cwd-default";
   const rootSelector = ROOT_SELECTOR_BY_SOURCE[source] ?? inferred?.selector;
   const pointer = snapshot.status;
-  const unsafe = (pointer !== "usable" && pointer !== "absent") || failedSelectors.length > 0;
+  const unsafe = (pointer !== "usable" && pointer !== "absent") || failedSelectors.length > 0 || unverifiedSelectors.length > 0;
+  const hasUnverifiedSelectors = unverifiedSelectors.length > 0;
+  const identityProbeReason =
+    snapshot.liveness === "identity-indeterminate"
+      ? "process-identity-indeterminate"
+      : snapshot.liveness === "stale-dead"
+        ? "stale-dead"
+        : snapshot.liveness === "usable"
+          ? "usable"
+          : undefined;
   const fields = [
     `src=${source}`,
     ...(rootSelector && unsafe ? [`root_selector=${rootSelector}`] : []),
@@ -443,6 +468,7 @@ export function formatStateRootSessionBindingDiagnostic(
       ? [`selected_session_json=${safeSelectedSessionJsonLabel(snapshot.selectedSessionJson)}`]
       : []),
     ...(reportBadSelectors.length > 0 ? [`bad_selectors=${reportBadSelectors.join(",")}`] : []),
+    ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
   ];
   const raw = fields.join(" ");
   if (raw.length <= 240 && !(rootSelector && unsafe)) return sanitizeBindingDiagnosticLine(raw);
@@ -491,8 +517,14 @@ export function formatStateRootSessionBindingDiagnostic(
         : []),
       ...(selectedSessionLabel ? ["selected=session.json"] : []),
       ...(badSelectorsField ? [badSelectorsField] : []),
+      ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
     ];
-    return canonicalFields.join(";");
+    const canonical = canonicalFields.join(";");
+    if (canonical.length <= 240) return canonical;
+    // Drop the owner advisory before any selector evidence so the line stays within the cap.
+    return sanitizeBindingDiagnosticLine(
+      canonicalFields.filter((field) => !field.startsWith("owner=")).join(";"),
+    );
   }
   const buildCompactFields = (
     selectedEvidence: string | undefined,
@@ -503,6 +535,7 @@ export function formatStateRootSessionBindingDiagnostic(
     ...(includeFixLabel ? [`fix=${recovery}`] : [recovery]),
     ...(selectedEvidence ? [selectedEvidence] : []),
     ...(badSelectorsField ? [badSelectorsField] : []),
+    ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
   ];
   const compactWithFullEvidence = buildCompactFields(
     selectedSessionLabel ? `selected_session_json=${selectedSessionLabel}` : undefined,
@@ -548,6 +581,7 @@ export function formatStateRootSessionBindingDiagnostic(
       : []),
     ...(selectedSessionLabel ? ["selected=session.json"] : []),
     ...(badSelectorsField ? [badSelectorsField] : []),
+    ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
   ];
   return sanitizeBindingDiagnosticLine(fallbackFields.join(";"));
 }
@@ -573,9 +607,24 @@ export function checkStateRootSessionBinding(
     };
   }
   let status: Check["status"] = "fail";
-  if (snapshot.status === "absent" && evaluation.bad.length === 0) status = "pass";
-  else if (snapshot.status === "stale-dead" && evaluation.bad.length === 0) status = "warn";
-  else if (snapshot.status === "usable" && evaluation.bad.length === 0) status = "pass";
+  if (
+    snapshot.status === "absent" &&
+    evaluation.bad.length === 0 &&
+    evaluation.unverified.length === 0
+  )
+    status = "pass";
+  else if (
+    snapshot.status === "stale-dead" &&
+    evaluation.bad.length === 0 &&
+    evaluation.unverified.length === 0
+  )
+    status = "warn";
+  else if (
+    snapshot.status === "usable" &&
+    evaluation.bad.length === 0 &&
+    evaluation.unverified.length === 0
+  )
+    status = "pass";
   const message = formatStateRootSessionBindingDiagnostic(snapshot, env, evaluation.bad);
   return { name: "State root/session binding", status, message };
 }
@@ -771,7 +820,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	checks.push(checkDirectory("Codex home", paths.codexHomeDir));
 
 	// Check 4: Config file
-	const configCheck = await checkConfig(paths.configPath);
+	const configCheck = await checkConfig(paths.configPath, scopeResolution.scope);
 	checks.push(configCheck);
 	const multiAgentCompatibilityCheck = await checkLegacyMultiAgentCompatibility(
 		paths.configPath,
@@ -1775,9 +1824,21 @@ export async function checkLegacyMultiAgentCompatibility(
 	}
 }
 
-async function checkConfig(configPath: string): Promise<Check> {
+async function checkConfig(configPath: string, scope: DoctorSetupScope): Promise<Check> {
 	if (!existsSync(configPath)) {
-		return { name: "Config", status: "warn", message: "config.toml not found" };
+		const resolvedConfigPath = resolve(configPath);
+		const codexHomeHint = scope === "user" && process.env.CODEX_HOME
+			&& resolvedConfigPath === resolve(codexConfigPath())
+			? ` CODEX_HOME is set, so this is the active Codex config path.`
+			: "";
+		const setupTarget = scope === "project" ? "this project scope" : "this Codex home";
+		return {
+			name: "Config",
+			status: "warn",
+			message:
+				`config.toml not found at ${resolvedConfigPath}.${codexHomeHint} ` +
+				`This check did not create it; run "omx setup" for ${setupTarget} to repair.`,
+		};
 	}
 
 	try {
@@ -2719,6 +2780,7 @@ function combineNativeHookIntegrityAndRemovalChecks(
 async function checkExistingNativeHooks(
 	hooksPath: string,
 	context: NativeHookCheckContext,
+	configPath?: string,
 ): Promise<Check> {
 	const platform = context.platform ?? process.platform;
 	try {
@@ -2767,10 +2829,48 @@ async function checkExistingNativeHooks(
 				name: "Native hooks",
 				status: removalIsCoordinateOnly ? "warn" : "fail",
 				message: removalIsCoordinateOnly
-					? `hooks.json has OMX entries that cannot be safely removed (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; manual cleanup is required because doctor will not overwrite or remove it`
+					? `hooks.json has OMX entries that cannot be safely removed (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}. Remediation: reconcile the exact hook order and [hooks.state] keys shown above, then rerun "omx setup --plugin" or "omx uninstall"; doctor will not overwrite or remove the files`
 					: `hooks.json has ambiguous or untrusted OMX ownership (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; inspect the file manually because doctor will not overwrite or remove it`,
 			};
 			return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, removalCheck);
+		}
+		if (removalPlan.coordinateMoves.length > 0) {
+			let configContent = "";
+			if (configPath && existsSync(configPath)) {
+				try {
+					const decoded = decodeStrictUtf8(await readFile(configPath));
+					if (decoded === null) throw new Error("config.toml is not valid UTF-8");
+					configContent = decoded;
+				} catch (error) {
+					const detail = error instanceof Error ? error.message : String(error);
+					return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, {
+						name: "Native hooks",
+						status: "warn",
+						message: `hooks.json removal shifts foreign hook coordinates, but doctor could not verify [hooks.state] in ${configPath}: ${detail}. Remediation: inspect config.toml and reconcile the exact keys before running "omx setup --plugin" or "omx uninstall"`,
+					});
+				}
+			}
+			try {
+				migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+					configContent,
+					removalPlan.coordinateMoves,
+					{
+						priorManagedHookTrustState: removalPlan.priorTrustState,
+						managedTrustState: removalPlan.finalTrustState,
+					},
+				);
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				const errorCode = typeof error === "object" && error !== null &&
+					"code" in error && typeof error.code === "string"
+					? ` (${error.code})`
+					: "";
+				return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, {
+					name: "Native hooks",
+					status: "warn",
+					message: `Foreign hook trust migration is unsafe${errorCode}: ${detail} Remediation: restore the current hook definition and matching trusted_hash or manually reconcile the listed [hooks.state] keys, then rerun "omx setup --plugin" or "omx uninstall"`,
+				});
+			}
 		}
 		if (windowsShimCheck) return windowsShimCheck;
 		const legacyTrustStateEntries = Object.keys(removalPlan.legacyTrustState).length;
@@ -2835,7 +2935,7 @@ export async function checkNativeHooks(
 			const configContent = await readFile(configPath, "utf-8");
 			if (configEnablesPluginScopedHooks(configContent, context.codexFeaturesListOutput)) {
 				const globalCheck = existsSync(hooksPath)
-					? await checkExistingNativeHooks(hooksPath, context)
+					? await checkExistingNativeHooks(hooksPath, context, configPath)
 					: null;
 				return combinePluginAndGlobalNativeHookChecks(
 					await checkPluginScopedNativeHooks(context.codexHomeDir, hooksPath),
@@ -2882,7 +2982,7 @@ export async function checkNativeHooks(
 		};
 	}
 
-	return checkExistingNativeHooks(hooksPath, context);
+	return checkExistingNativeHooks(hooksPath, context, configPath);
 }
 
 export async function checkNativeHookDistSmoke(

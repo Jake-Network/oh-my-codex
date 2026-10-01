@@ -4759,9 +4759,9 @@ describe("tmux HUD pane helpers", () => {
       calls.push(args);
       if (args.at(-1) === "#{pane_id}") return "%1\n%2\n";
       return [
-        "%1\x1fcodex\x1f0\x1f0\x1f100\x1f40\x1f39\x1f100\x1f40\x1fcodex\x1f/repo\x1f0\x1f101",
-        "%2\x1fnode\x1f0\x1f40\x1f100\x1f3\x1f42\x1f100\x1f43\x1fexec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' node /tmp/bin/dist/cli/omx.js hud --watch\x1f/repo\x1f0\x1f202",
-      ].join("\n");
+        "%1\x1fcodex\x1f0\x1f0\x1f100\x1f40\x1f39\x1f100\x1f40\x1f\x1f\x1f0\x1f101\x1fcodex\x1f/repo",
+        "%2\x1fnode\x1f0\x1f40\x1f100\x1f3\x1f42\x1f100\x1f43\x1f\x1f\x1f0\x1f202\x1fexec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' node /tmp/bin/dist/cli/omx.js hud --watch\x1f/repo",
+      ].join("\n") + "\n";
     });
 
     assert.deepEqual(panes, []);
@@ -4781,10 +4781,12 @@ describe("tmux HUD pane helpers", () => {
         "#{pane_bottom}",
         "#{window_width}",
         "#{window_height}",
-        "#{pane_start_command}",
-        "#{pane_current_path}",
+        "#{session_id}",
+        "#{window_id}",
         "#{pane_dead}",
         "#{pane_pid}",
+        "#{pane_start_command}",
+        "#{pane_current_path}",
       ].join("\x1f"),
     ]);
   });

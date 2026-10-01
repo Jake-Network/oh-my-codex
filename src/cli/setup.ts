@@ -72,6 +72,8 @@ import {
 	upsertPluginModeRuntimeFeatureFlags,
 	upsertManagedCodexHookTrustState,
 	stripManagedCodexHookTrustState,
+	migrateManagedCodexHookTrustStateCoordinates,
+	migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged,
 	OMX_DEVELOPER_INSTRUCTIONS,
 	OMX_PLUGIN_DEVELOPER_INSTRUCTIONS,
 	hasFirstPartyOmxMcpRegistrations,
@@ -82,10 +84,13 @@ import type { CodexHookFeatureFlag, CodexPluginHookFeatureFlag } from "../config
 import {
 	buildManagedCodexNativeHookWindowsShimContent,
 	buildManagedCodexNativeHookWindowsShimPath,
+	escapeTomlBasicString,
 	planManagedCodexHooksMerge,
 	planManagedCodexHooksRemoval,
 	classifyManagedCodexNativeHookWindowsShimOwnership,
 	ManagedCodexHooksPlanError,
+	type ManagedCodexHookCoordinateMove,
+	type ManagedCodexHookRemovalCoordinate,
 	type ManagedCodexHookTrustState,
 	type ManagedCodexHooksPlan,
 	validateCodexHooksConfigStrict,
@@ -339,42 +344,77 @@ function stripNamedXmlSection(content: string, sectionName: string): string {
 	);
 }
 
-function applyTeamModeToAgentsTemplate(content: string, teamMode: SetupTeamMode): string {
+/**
+ * #3699: clause-level rewrites for lines that mix Team wording with guidance that
+ * must survive Team opt-out (native subagent delegation, child-agent limits,
+ * cancellation and state-ownership invariants). Dropping such lines wholesale
+ * deleted non-Team rules and left malformed sentences behind.
+ */
+const TEAM_DISABLED_CLAUSE_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
+	[/ THIS IS COMPLEMENTARY TO OMX TEAM MODE\./g, ""],
+	[/Within one Codex session or team pane,/g, "Within one Codex session,"],
+	[/;\s*`worker` is a team-runtime surface, not a general-purpose child role/g, ""],
+	[/Use Team only for durable multi-lane coordination that is worth the overhead; when/g, "When"],
+	[/Outside active `team`\/`swarm` mode,/g, "Outside active `swarm` mode,"],
+	[/current, proven session or Team scope/g, "current, proven session scope"],
+	[/, legacy roots, Team artifacts, and tmux sessions untouched/g, ", legacy roots, and tmux sessions untouched"],
+	[/hook boundaries, cancellation, and Team coordination\./g, "hook boundaries, and cancellation."],
+];
+
+/**
+ * #3699: lines whose entire subject is the Team runtime. Each pattern must be
+ * anchored on the Team-only subject so that future mixed guidance is rewritten
+ * by {@link TEAM_DISABLED_CLAUSE_REWRITES} instead of silently disappearing.
+ */
+const TEAM_DISABLED_LINE_DROP_PATTERNS: readonly RegExp[] = [
+	/^- Use `\$team` when\b/i,
+	/^- Reserve `worker` strictly for active\b/i,
+	/^- `worker` is a team-runtime surface\b/i,
+	/^- `<!-- OMX:TEAM:WORKER:START -->/,
+	/^- Teams may \b/i,
+	/^- The Team state files\b/i,
+	/^- Team cancellation requires\b/i,
+	/^- Team runtime is explicit\b/i,
+	/^- Team shutdown waits\b/i,
+	/^- Workers ACK startup\b/i,
+	/^- Prefer durable state writes and `omx team api\b/i,
+	/team mode/i,
+	/team orchestration/i,
+	/team pipeline/i,
+	/omx team/i,
+];
+
+function stripMarkdownSection(content: string, heading: string): string {
+	return content.replace(
+		new RegExp(`\\n${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[\\s\\S]*?(?=\\n#{2,3} )`, "g"),
+		"\n",
+	);
+}
+
+export function applyTeamModeToAgentsTemplate(content: string, teamMode: SetupTeamMode): string {
 	if (teamModeEnabled(teamMode)) return content;
 
 	let next = content;
 	for (const section of ["team_compositions", "team_pipeline", "team_model_resolution"]) {
 		next = stripNamedXmlSection(next, section);
 	}
+	next = stripMarkdownSection(next, "### Team protocol");
 
-	return next
+	for (const [pattern, replacement] of TEAM_DISABLED_CLAUSE_REWRITES) {
+		next = next.replace(pattern, replacement);
+	}
+	next = next
 		.replace(/\(\+ \$team if needed\)/g, "")
-		.replace(/- `\$team` when[^\n]*\n/g, "")
 		.replace(/,?\s*`team`,?/g, "")
 		.replace(/\s*\|\s*`\$team ".*?"`\s*\|.*\|\n/g, "\n")
+		.replace(/\/?\s*`team`\/`swarm`/g, "`swarm`");
+
+	return next
+		.split("\n")
+		.filter((line) => !TEAM_DISABLED_LINE_DROP_PATTERNS.some((pattern) => pattern.test(line)))
+		.join("\n")
 		.replace(/,?\s*`\$team`/g, "")
 		.replace(/`\$team`,?\s*/g, "")
-		.replace(/\/?\s*`team`\/`swarm`/g, "`swarm`")
-		.split("\n")
-		.filter((line) => {
-			const normalized = line.toLowerCase();
-			if (normalized.includes("team mode")) return false;
-			if (normalized.includes("team runtime")) return false;
-			if (normalized.includes("team orchestration")) return false;
-			if (normalized.includes("team/swarm")) return false;
-			if (normalized.includes("team pipeline")) return false;
-			if (normalized.includes("runtime/team")) return false;
-			if (normalized.includes("team overlays")) return false;
-			if (normalized.includes("team pane")) return false;
-			if (normalized.startsWith("- teams may ")) return false;
-			if (normalized.includes("outside active `team`")) return false;
-			if (normalized.includes("reserve `worker`")) return false;
-			if (normalized.includes("worker` is a team-runtime")) return false;
-			if (normalized.includes("team-plan")) return false;
-			if (normalized.includes("omx team")) return false;
-			return true;
-		})
-		.join("\n")
 		.replace(/\n{3,}/g, "\n\n");
 }
 
@@ -3356,6 +3396,9 @@ interface PluginModeHooksConfigPlan {
 	finalConfig: string;
 	hooksFinalContent: string | null;
 	hooksRemovedCount: number;
+	removedCoordinates: ManagedCodexHookRemovalCoordinate[];
+	coordinateMoves: ManagedCodexHookCoordinateMove[];
+	trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"];
 	cleanedLegacyConfig: boolean;
 	diagnostics: readonly { message: string }[];
 }
@@ -3428,20 +3471,31 @@ function buildPluginModeHooksConfigPlan(
 				options.pluginScopedHooks && managedHooksPlan?.hasForeignHooks === true,
 		},
 	);
+	const trustMigration = migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+		configWithRuntimeFeatures,
+		managedHooksPlan?.coordinateMoves ?? [],
+		{
+			managedTrustState: managedHookTrustState,
+			priorManagedHookTrustState,
+		},
+	);
+	const configWithManagedTrustState = upsertManagedCodexHookTrustState(
+		trustMigration.config,
+		pkgRoot,
+		hooksPath,
+		{
+			...managedHookOptions,
+			managedTrustState: managedHookTrustState,
+			legacyHookTrustState,
+		},
+	);
 	return {
-		finalConfig: upsertManagedCodexHookTrustState(
-			configWithRuntimeFeatures,
-			pkgRoot,
-			hooksPath,
-			{
-				...managedHookOptions,
-				managedTrustState: managedHookTrustState,
-				priorManagedHookTrustState,
-				legacyHookTrustState,
-			},
-		),
+		finalConfig: configWithManagedTrustState,
 		hooksFinalContent: managedHooksPlan ? managedHooksPlan.finalContent : existingHooksContent,
-	hooksRemovedCount: managedHooksPlan?.removedCount ?? 0,
+		hooksRemovedCount: managedHooksPlan?.removedCount ?? 0,
+		removedCoordinates: managedHooksPlan?.removedCoordinates ?? [],
+		coordinateMoves: managedHooksPlan?.coordinateMoves ?? [],
+		trustKeyRewrites: trustMigration.keyRewrites,
 		cleanedLegacyConfig: configAfterLegacyCleanup !== existingConfig,
 		diagnostics: managedHooksPlan?.diagnostics ?? [],
 	};
@@ -3525,6 +3579,9 @@ interface NativeHookSetupTransactionPlan {
 	cleanedLegacyConfig: boolean;
 	pluginMarketplaceResult: "updated" | "unchanged" | "unavailable";
 	pluginDeveloperInstructionsResult: "updated" | "exists" | "skipped";
+	removedCoordinates: ManagedCodexHookRemovalCoordinate[];
+	coordinateMoves: ManagedCodexHookCoordinateMove[];
+	trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"];
 	diagnostics: readonly { message: string }[];
 	modelUpgrade?: { currentModel: string; modelOverride: string };
 	repairedLegacyTeamRunTable: boolean;
@@ -3625,6 +3682,7 @@ function stripHookFeatureFlagsForDisable(
 
 interface DisableHooksNotifyPlan {
 	finalConfig: string;
+	trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"];
 	metadataPath?: string;
 	metadataAfter: Buffer | null;
 }
@@ -3671,14 +3729,17 @@ async function planDisableHooksConfig(
 	existingConfig: string,
 	pkgRoot: string,
 	managedHooksPlan: ManagedCodexHooksPlan | null,
+	coordinateMoves: readonly ManagedCodexHookCoordinateMove[],
 	codexHomeDir: string,
 	notifyMetadataSnapshot?: NativeHookTransactionArtifactSnapshot,
 ): Promise<DisableHooksNotifyPlan> {
 	const priorManagedHookTrustState = managedHooksPlan?.priorTrustState ?? {};
-	let finalConfig = stripManagedCodexHookTrustState(existingConfig, {
-		priorManagedHookTrustState,
-		managedTrustState: {},
-	});
+	const trustMigration = migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+		existingConfig,
+		coordinateMoves,
+		{ priorManagedHookTrustState },
+	);
+	let finalConfig = trustMigration.config;
 	finalConfig = stripHookFeatureFlagsForDisable(
 		finalConfig,
 		managedHooksPlan?.hasForeignHooks === true,
@@ -3686,7 +3747,7 @@ async function planDisableHooksConfig(
 	finalConfig = stripLocalOmxPluginEnablementForDisable(finalConfig);
 	const notify = getRootTomlArray(finalConfig, "notify");
 	if (!notify || !isOmxManagedNotifyCommand(notify, pkgRoot)) {
-		return { finalConfig, metadataAfter: null };
+		return { finalConfig, trustKeyRewrites: trustMigration.keyRewrites, metadataAfter: null };
 	}
 	const metadataPath = getNotifyMetadataPath(codexHomeDir);
 	if (isOmxDispatcherNotifyCommand(notify, pkgRoot)) {
@@ -3702,9 +3763,13 @@ async function planDisableHooksConfig(
 				`notify = ${formatTomlStringArray(previousNotify)}`,
 			);
 		}
-		return { finalConfig, metadataPath, metadataAfter: null };
+		return { finalConfig, trustKeyRewrites: trustMigration.keyRewrites, metadataPath, metadataAfter: null };
 	}
-	return { finalConfig: removeRootTomlKey(finalConfig, "notify"), metadataAfter: null };
+	return {
+		finalConfig: removeRootTomlKey(finalConfig, "notify"),
+		trustKeyRewrites: trustMigration.keyRewrites,
+		metadataAfter: null,
+	};
 }
 
 async function planNativeHookSetupTransaction(
@@ -3730,6 +3795,9 @@ async function planNativeHookSetupTransaction(
 	let finalConfig = existingConfig;
 	let finalHooksContent = existingHooksContent;
 	let hooksRemovedCount = 0;
+	let removedCoordinates: ManagedCodexHookRemovalCoordinate[] = [];
+	let coordinateMoves: ManagedCodexHookCoordinateMove[] = [];
+	let trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"] = [];
 	let cleanedLegacyConfig = false;
 	let pluginMarketplaceResult: NativeHookSetupTransactionPlan["pluginMarketplaceResult"] = "unchanged";
 	let pluginDeveloperInstructionsResult: NativeHookSetupTransactionPlan["pluginDeveloperInstructionsResult"] = "skipped";
@@ -3749,16 +3817,20 @@ async function planNativeHookSetupTransaction(
 			managedHooksPlan = removal;
 			finalHooksContent = removal.finalContent;
 			hooksRemovedCount = removal.removedCount;
+			removedCoordinates = removal.removedCoordinates;
+			coordinateMoves = removal.coordinateMoves;
 			diagnostics = removal.diagnostics;
 		}
 		const notifyPlan = await planDisableHooksConfig(
 			existingConfig,
 			options.pkgRoot,
 			managedHooksPlan,
+			coordinateMoves,
 			options.codexHomeDir,
 			options.notifyMetadataSnapshot,
 		);
 		finalConfig = notifyPlan.finalConfig;
+		trustKeyRewrites = notifyPlan.trustKeyRewrites;
 		if (notifyPlan.metadataPath) {
 			const metadataBefore = options.notifyMetadataSnapshot ?? { bytes: null, topology: { kind: "absent" } };
 			notifyMetadataPrecondition = nativeHookTransactionPrecondition(
@@ -3797,6 +3869,9 @@ async function planNativeHookSetupTransaction(
 		finalConfig = pluginPlan.finalConfig;
 		finalHooksContent = pluginPlan.hooksFinalContent;
 		hooksRemovedCount = pluginPlan.hooksRemovedCount;
+		removedCoordinates = pluginPlan.removedCoordinates;
+		coordinateMoves = pluginPlan.coordinateMoves;
+		trustKeyRewrites = pluginPlan.trustKeyRewrites;
 		cleanedLegacyConfig = pluginPlan.cleanedLegacyConfig;
 		diagnostics = pluginPlan.diagnostics;
 
@@ -3837,6 +3912,8 @@ async function planNativeHookSetupTransaction(
 		}
 		finalHooksContent = managedHooksPlan.finalContent;
 		hooksRemovedCount = managedHooksPlan.removedCount;
+		removedCoordinates = managedHooksPlan.removedCoordinates;
+		coordinateMoves = managedHooksPlan.coordinateMoves;
 		diagnostics = managedHooksPlan.diagnostics;
 		const managedConfigPlan = await planManagedConfig(
 			options.hooksPath,
@@ -4018,6 +4095,9 @@ async function planNativeHookSetupTransaction(
 		),
 		finalConfig,
 		hooksRemovedCount,
+		removedCoordinates,
+		coordinateMoves,
+		trustKeyRewrites,
 		pluginScopedHooks: options.pluginScopedHooks,
 		cleanedLegacyConfig,
 		pluginMarketplaceResult,
@@ -4624,6 +4704,23 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	logManagedCodexHooksPlanDiagnostics(nativeHookSetupTransaction.diagnostics, {
 		verbose,
 	});
+	if (dryRun || verbose) {
+		for (const coordinate of nativeHookSetupTransaction.removedCoordinates) {
+			console.log(
+				`  ${dryRun ? "Would remove" : "Removing"} OMX hook ${coordinate.eventName} [${coordinate.groupIndex},${coordinate.handlerIndex}]`,
+			);
+		}
+		for (const move of nativeHookSetupTransaction.coordinateMoves) {
+			console.log(
+				`  ${dryRun ? "Would move" : "Moving"} foreign hook ${move.eventName} [${move.oldGroupIndex},${move.oldHandlerIndex}] -> [${move.newGroupIndex},${move.newHandlerIndex}]`,
+			);
+		}
+		for (const rewrite of nativeHookSetupTransaction.trustKeyRewrites) {
+			console.log(
+				`  ${dryRun ? "Would rewrite" : "Rewrote"} [hooks.state."${escapeTomlBasicString(rewrite.oldKey)}"] -> [hooks.state."${escapeTomlBasicString(rewrite.newKey)}"] (trusted_hash unchanged)`,
+			);
+		}
+	}
 	const changedHookArtifact = nativeHookSetupTransaction.artifacts.some(
 		(artifact) => artifact.kind === "hooks",
 	);
