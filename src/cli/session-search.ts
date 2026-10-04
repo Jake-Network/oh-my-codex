@@ -1,11 +1,13 @@
 import { inspectSessionPointerLock, recoverDeadSessionPointer, recoverSessionPointerLock } from '../hooks/session.js';
 import { buildSessionFrictionReport, type SessionFrictionReport, type SessionFrictionOptions } from '../session-history/friction.js';
 import { searchSessionHistory, type SessionSearchReport, type SessionSearchOptions } from '../session-history/search.js';
+import { sessionExportCommand } from './session-export.js';
 
 const HELP = `omx session - Search and summarize local session history
 
 Usage:
   omx session search <query> [options]
+  omx session export <session-id> [--format markdown|json] [--output <path>] [--include-tools]
   omx session friction [options]
   omx session lock <inspect|recover> [--cwd <path>] [--json]
   omx session pointer recover [--cwd <path>] [--json]
@@ -42,6 +44,7 @@ Options for pointer:
 Examples:
   omx session search "worker inbox path"
   omx session search all_workers_idle --since 7d --limit 5
+  omx session export <session-id> --output conversation.md
   omx session friction --project current
   omx session friction --session <id> --json
   omx session lock inspect --json
@@ -373,6 +376,11 @@ export async function sessionCommand(args: string[]): Promise<void> {
 
   if (subcommand === 'pointer') {
     await sessionPointerCommand(args.slice(1));
+    return;
+  }
+
+  if (subcommand === 'export') {
+    await sessionExportCommand(args.slice(1));
     return;
   }
 

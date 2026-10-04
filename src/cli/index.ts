@@ -275,6 +275,7 @@ Usage:
   omx explore   DEPRECATED compatibility command; use normal repo inspection or omx sparkshell
   omx api       Run native omx-api localhost gateway commands (serve|status|stop|generate)
   omx session   Search and summarize local session history (--codex-home <path> escape hatch)
+                Export active or archived conversations as Markdown or JSON
                 Includes session lock diagnostics and verified-dead pointer recovery
   omx url       Passive URL reader (read <url> --json)
   omx capabilities

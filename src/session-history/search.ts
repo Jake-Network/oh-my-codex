@@ -144,7 +144,7 @@ export function parseSinceSpec(value: string | undefined, now = Date.now()): num
   throw new Error(`Invalid --since value "${value}". Use formats like 7d, 24h, or 2026-03-10.`);
 }
 
-async function listRolloutFiles(root: string): Promise<string[]> {
+export async function listRolloutFiles(root: string): Promise<string[]> {
   if (!existsSync(root)) return [];
 
   const files: string[] = [];
