@@ -200,10 +200,18 @@ export function resolveRuntimeBinaryPath(options: RuntimeBinaryDiscoveryOptions 
   }
 
   const binaryName = binaryNameForPlatform(platform);
-  const workspaceDebug = options.debugPath ?? resolve(__bridge_dirname, '../../target/debug', binaryName);
+  const workspaceDebug = options.debugPath
+    ? platform === 'win32'
+      ? `${options.debugPath}.exe`
+      : options.debugPath
+    : resolve(__bridge_dirname, '../../target/debug', binaryName);
   if (exists(workspaceDebug)) return workspaceDebug;
 
-  const workspaceRelease = options.releasePath ?? resolve(__bridge_dirname, '../../target/release', binaryName);
+  const workspaceRelease = options.releasePath
+    ? platform === 'win32'
+      ? `${options.releasePath}.exe`
+      : options.releasePath
+    : resolve(__bridge_dirname, '../../target/release', binaryName);
   if (exists(workspaceRelease)) return workspaceRelease;
 
   return options.fallbackBinary ?? binaryName;
