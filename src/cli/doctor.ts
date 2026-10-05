@@ -603,7 +603,7 @@ export function checkStateRootSessionBinding(
     return {
       name: "State root/session binding",
       status: "warn",
-      message: "src=cwd-default ptr=absent; runtime binding unavailable: inherited CODEX_SESSION_ID has no OMX session pointer; no runtime authority verified",
+      message: "src=cwd-default ptr=absent; Codex session detected but not OMX-managed. Non-OMX workflows do not require OMX binding. To use OMX features: run 'omx init' or verify OMX installation.",
     };
   }
   let status: Check["status"] = "fail";

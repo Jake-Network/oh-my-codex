@@ -35,7 +35,9 @@ describe('doctor state-root/session binding diagnostics', () => {
       { CODEX_SESSION_ID: 'codex-session' },
     );
     assert.equal(check.status, 'warn');
-    assert.match(check.message, /runtime binding unavailable/);
+    assert.match(check.message, /not OMX-managed/);
+    
+    assert.doesNotMatch(check.message, /bad_selectors|clear|relaunch|unset/);
     assert.doesNotMatch(check.message, /bad_selectors|clear|relaunch/);
   });
 
@@ -373,3 +375,17 @@ describe('doctor state-root/session binding diagnostics', () => {
     }
   });
 });
+
+  it('distinguishes ordinary Codex sessions from broken OMX bindings', () => {
+    // Ordinary Codex session without OMX binding should warn but not suggest the session is broken
+    const check = checkStateRootSessionBinding(
+      syntheticSnapshot('absent', { rootSource: 'cwd-default' }),
+      { CODEX_SESSION_ID: 'codex-session' },
+    );
+    assert.equal(check.status, 'warn');
+    assert.match(check.message, /Codex session detected but not OMX-managed/);
+    assert.match(check.message, /[Nn]on-OMX workflows do not require OMX binding/);
+    assert.match(check.message, /omx init/);
+    // Should not suggest breaking the Codex session
+    assert.doesNotMatch(check.message, /unset|CODEX_SESSION_ID/);
+  });
