@@ -2882,6 +2882,35 @@ exit 1
     }
   });
 
+  it('writeAtomic tolerates Windows EPERM syncing the temp file', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-file-sync-eperm.txt');
+      let fileSyncs = 0;
+      setWriteAtomicPlatformForTests('win32');
+      setWriteAtomicOpenForTests(async (...args) => {
+        const handle = await open(...args);
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => {
+          fileSyncs += 1;
+          const error = new Error('Windows cannot fsync this file') as NodeJS.ErrnoException;
+          error.code = 'EPERM';
+          throw error;
+        };
+        return handle;
+      });
+
+      await writeAtomic(p, 'durable data');
+
+      assert.equal(fileSyncs, 1);
+      assert.equal(readFileSync(p, 'utf8'), 'durable data');
+    } finally {
+      resetWriteAtomicPlatformForTests();
+      resetWriteAtomicOpenForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('readWorkerStatus returns {state:\'unknown\'} on missing file', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
     try {
