@@ -2894,7 +2894,7 @@ exit 1
         const sync = handle.sync.bind(handle);
         handle.sync = async () => {
           // Only throw EPERM when syncing the temp file, not the parent directory
-          if (path.endsWith('.txt.tmp')) {
+          if (String(path).endsWith('.txt.tmp')) {
             fileSyncs += 1;
             const error = new Error('Windows cannot fsync this file') as NodeJS.ErrnoException;
             error.code = 'EPERM';
