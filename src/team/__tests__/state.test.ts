@@ -2889,20 +2889,26 @@ exit 1
       let fileSyncs = 0;
       setWriteAtomicPlatformForTests('win32');
       setWriteAtomicOpenForTests(async (...args) => {
+        const [path] = args;
         const handle = await open(...args);
         const sync = handle.sync.bind(handle);
         handle.sync = async () => {
+          // Only throw EPERM when syncing the temp file, not the parent directory
+          if (path.endsWith('.txt.tmp')) {
+            fileSyncs += 1;
+            const error = new Error('Windows cannot fsync this file') as NodeJS.ErrnoException;
+            error.code = 'EPERM';
+            throw error;
+          }
           fileSyncs += 1;
-          const error = new Error('Windows cannot fsync this file') as NodeJS.ErrnoException;
-          error.code = 'EPERM';
-          throw error;
+          await sync();
         };
         return handle;
       });
 
       await writeAtomic(p, 'durable data');
 
-      assert.equal(fileSyncs, 1);
+      assert.equal(fileSyncs, 2); // One for temp file (EPERM), one for parent dir
       assert.equal(readFileSync(p, 'utf8'), 'durable data');
     } finally {
       resetWriteAtomicPlatformForTests();
