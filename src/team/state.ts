@@ -4,6 +4,7 @@ import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
 import { readUsableSessionState } from '../hooks/session.js';
+import { syncRegularFile } from '../utils/file-durability.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
   computeTaskReadiness as computeTaskReadinessImpl,
@@ -837,9 +838,9 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
 
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
   await writeFile(tmpPath, data, 'utf8');
-  const handle = await openForAtomicWrite(tmpPath, 'r');
+  const handle = await openForAtomicWrite(tmpPath, 'r+');
   try {
-    await handle.sync();
+    await syncRegularFile(handle, platformForAtomicWrite);
   } finally {
     await handle.close();
   }
