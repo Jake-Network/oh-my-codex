@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.8] - 2026-10-06
+
+### Highlights
+
+- Windows binary path compatibility: platform-specific `.exe` suffix is now correctly applied to omx-runtime binary paths on Windows, resolving resolution failures (#3736, #3737).
+- Session management robustness: thread identity resolution for native `$ralplan --advisory` is improved with dedicated `readPayloadSessionId` helper (#3740, #3741); `writeAtomic` Windows EPERM errors are handled correctly (#3744, #3746).
+- Legacy configuration support: support for legacy v0.21.6 AGENTS.md backup paths is restored via git rev-parse (#3739, #3742).
+- Session export capability: local sessions can now be exported as Markdown or JSON format (#3745).
+- Diagnostic improvements: warning messages for non-OMX Codex sessions are clarified (#3747, #3749).
+
+### Fixed
+
+- Windows path handling: apply platform-specific `.exe` suffix to omx-runtime binary paths (#3736, #3737); handle `writeAtomic` Windows EPERM errors correctly by using `syncRegularFile` (#3744, #3746).
+- Session management: resolve native `$ralplan --advisory` thread identity from `session_id` when hook payload carries no thread field (#3740, #3741).
+- Legacy backup support: support legacy v0.21.6 AGENTS.md backup path via git rev-parse (#3739, #3742); resolve absolute `--git-path` in linked worktrees; prefer team-state backup over legacy git-dir backup when both exist.
+- Diagnostic output: clarify warning message for non-OMX Codex sessions to avoid confusion about session authority and management state (#3747, #3749).
+
+### Added
+
+- Session export: export local sessions as Markdown or JSON format for integration with external systems and documentation.
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.8.md) and [release readiness](docs/qa/release-readiness-0.21.8.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.7...v0.21.8
+
 ## [0.21.7] - 2026-10-01
 
 ### Highlights
