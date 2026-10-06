@@ -1,36 +1,34 @@
-# oh-my-codex 0.21.7
+# oh-my-codex 0.21.8
 
-`0.21.7` is a correctness and robustness release for the frozen range `v0.21.6..38d27ed752d17f18690c43a2acc0f28c7a0e81ed` (49 commits, 102 files, +7246/−642): plugin integrity and template validation, HUD idle CPU optimization and correctness, Team runtime robustness, session management fixes, model catalog expansion, and dependency updates.
+`0.21.8` is a bugfix and compatibility release for the frozen range `v0.21.7..d2e91b866d540b9e2454edb1b928a56d9bd9a30c` (14 commits, 25 files, +1249/−51): Windows binary path handling, session management improvements, legacy configuration support, session export capability, and diagnostic message clarifications.
 
 ## Highlights
 
-- **Plugin skill contract resolution and template validation:** plugin skill links now resolve correctly inside the plugin snapshot context (#3708), and templates/AGENTS.md is validated in cache provenance checks to prevent corruption (#3707). Foreign hook trust is maintained during legacy hook migration (#3704).
-- **HUD idle CPU correctness:** hook metadata is kept atomic (#3706), idle reconciliation CPU storms are eliminated, native fixtures align with authority frames (#3706), and tmux probe errors are properly preserved (#3711).
-- **Team runtime and setup robustness:** queued leader notices remain safe after shutdown (#3692), and non-Team guidance is preserved when Team is disabled (#3699, #3700); Team worker instructions are written to a per-worker file passed via `OMX_MODEL_INSTRUCTIONS_FILE`, so they are no longer committed into the leader's `AGENTS.md` (#3717, #3718); `omx setup` no longer writes Codex's removed `features.child_agents_md` flag and strips existing copies (#3719, #3720).
-- **Session management fixes:** session identity binding is corrected (#3725, #3726), stderr summary is included in detached leader failures (#3727), and exec follow-ups are delivered in scoped Stop paths (#3728).
-- **Model catalog expansion:** GPT-6 Sol and Luna models are recognized (#3701), and gpt-6.1-sol is added to model catalogs (#3716).
+- **Windows binary path compatibility:** platform-specific `.exe` suffix is now correctly applied to omx-runtime binary paths on Windows, resolving resolution failures on Windows platforms (#3736, #3737).
+- **Session management robustness:** thread identity resolution for native `$ralplan --advisory` is improved with dedicated `readPayloadSessionId` helper (#3740, #3741); `writeAtomic` Windows EPERM errors are handled correctly (#3744, #3746).
+- **Legacy configuration support:** support for legacy v0.21.6 AGENTS.md backup paths is restored via git rev-parse, with proper handling of linked worktrees (#3739, #3742).
+- **Session export capability (#3745):** local sessions can now be exported as Markdown or JSON format for integration and documentation pipelines (authored by @hiSandog).
+- **Diagnostic improvements:** warning messages for non-OMX Codex sessions are clarified (#3747, #3749).
 
 ## Fixes and compatibility
 
-- Plugin system hardening: validate templates directory structure and AGENTS.md in plugin cache provenance (#3707); fix plugin skill contract links in snapshot context (#3708); preserve foreign hook trust during legacy migration (#3704).
-- HUD and tmux stability: keep hook metadata atomic and verify idle CPU (#3706); eliminate idle reconciliation CPU storms; align native hook fixtures with authority frames (#3706); handle tmux question probe errors correctly (#3711).
-- Session management: native `$ralplan --advisory` resolves thread identity from `session_id` when the hook payload carries no thread field (#3721, #3722); distinguish matching-but-unverified selectors in identity-indeterminate bindings (#3725, #3726); include stderr summary and exit status in detached leader failures (#3723, #3727); deliver exec follow-ups in session-scoped Stop path (#3724, #3728); prevent omx exec --help from attempting session establishment with an active owner (#3731, #3732); add 'ultragoal' to supported state read modes (#3733, #3734).
-- Team runtime: make queued leader notices safe after shutdown (#3692); preserve non-Team guidance when Team is disabled (#3699, #3700); Team worker instructions are written to a per-worker file passed via `OMX_MODEL_INSTRUCTIONS_FILE`, so they are no longer committed into the leader's `AGENTS.md` (#3717, #3718); `omx setup` no longer writes Codex's removed `features.child_agents_md` flag and strips existing copies (#3719, #3720).
-- Configuration and output: show resolved config path when missing (#3693); strip OSC terminal escapes in notifications (#3694); preserve hashes in quoted TOML values (#3712); clarify fresh config doctor evidence (#3691).
-- Dependency updates: `zod` 4.6.5, `@biomejs/biome` 2.5.14, `@types/node` 26.6.3, `@modelcontextprotocol/sdk` 1.30.1 (#3696, #3697, #3698, #3713, #3714).
+- Windows path handling: apply platform-specific `.exe` suffix to omx-runtime binary paths (#3736, #3737); handle `writeAtomic` Windows EPERM errors correctly by using `syncRegularFile` (#3744, #3746).
+- Session management: resolve native `$ralplan --advisory` thread identity from `session_id` when hook payload carries no thread field (#3740, #3741).
+- Legacy backup support: support legacy v0.21.6 AGENTS.md backup path via git rev-parse (#3739, #3742); resolve absolute `--git-path` in linked worktrees; prefer team-state backup over legacy git-dir backup.
+- Diagnostic output: clarify warning message for non-OMX Codex sessions (#3747, #3749).
 
 ## Validation evidence
 
-Frozen candidate verified with all core gates passing: TypeScript typecheck (tsc --noEmit), Biome lint (860 files, no issues), plugin mirror sync verification (24 directories), capabilities lock validation, prompt guidance verification, native agents verification (18 agents, 32 assets), and prompt inventory synchronization. All 49 commits in the range are verified present with clear user-visible changes.
+Frozen candidate verified with all core gates passing. All 14 commits in the range are verified present with clear user-visible changes.
 
-Full readiness evidence: `docs/qa/release-readiness-0.21.7.md`.
+Full readiness evidence: `docs/qa/release-readiness-0.21.8.md`.
 
 ## Contributors
 
-Thanks to [@Yeachan-Heo](https://github.com/Yeachan-Heo), [@lee3Q](https://github.com/lee3Q), [@NagyVikt](https://github.com/NagyVikt), [@ev78394](https://github.com/ev78394), [@hiSandog](https://github.com/hiSandog), [@TwegZhang](https://github.com/TwegZhang), [@Xrondev](https://github.com/Xrondev), and [@gaebal-gajae](https://github.com/gaebal-gajae), with dependency updates from Dependabot.
+Thanks to [@Yeachan-Heo](https://github.com/Yeachan-Heo), [@hiSandog](https://github.com/hiSandog), and [@gaebal-gajae](https://github.com/gaebal-gajae).
 
 ## Inventory
 
-The reproducible range is recorded in `artifacts/release-0.21.7/inventory.md`.
+The reproducible range is recorded in `artifacts/release-0.21.8/inventory.md`.
 
-**Full Changelog**: [`v0.21.6...v0.21.7`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.6...v0.21.7)
+**Full Changelog**: [`v0.21.7...v0.21.8`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.7...v0.21.8)

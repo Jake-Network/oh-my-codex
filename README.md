@@ -349,6 +349,20 @@ These are useful, but they are not the main onboarding path.
 
 Use `omx mission` when you have a short checklist of OmX/Codex prompts that should run one after another instead of opening a separate shell command for each prompt. Start with `omx mission plan ./mission.md` or `omx mission ./mission.md --dry-run` to validate parsing and inspect the durable summary, then run `omx mission run ./mission.md -- --model gpt-5` when the prompts are ready. Interrupted runs can be inspected with `omx mission status ./mission.md`, continued with `omx mission resume ./mission.md`, operator-blocked with `omx mission mark ./mission.md --task task-002 --status blocked`, and repaired task-by-task with `omx mission rerun ./mission.md --task task-002`. See [`docs/mission.md`](./docs/mission.md) for input format, status output, and artifact details.
 
+### Export a previous conversation
+
+Use `omx session search "a phrase you remember"` to find a session ID, then
+`omx session export <session-id> --output conversation.md` to save its conversation.
+Export accepts an exact ID or a unique prefix and includes active and archived
+transcripts from the same Codex homes discovered by session search. Use
+`--format json` for structured output, `--include-tools` for tool arguments and
+outputs, or `--codex-home <path>` to select one home. Omitting `--output` writes
+to stdout; an existing output file is never overwritten.
+
+Only user and assistant messages are included by default. System/developer
+instructions and reasoning records are excluded; message text is not redacted.
+See [session export](./docs/session-export.md) for supported records and examples.
+
 ### Team runtime
 
 Use the team runtime when you specifically need durable tmux/worktree coordination, not as the default way to begin using OMX. In Codex App or plain outside-tmux sessions, treat `omx team` as a tmux-runtime shell surface rather than a directly available in-app workflow; launch OMX CLI from shell first if you actually want team execution.
